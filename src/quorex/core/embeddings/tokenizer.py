@@ -45,44 +45,46 @@ class Tokenizer:
         return tokens
     
     ATOMIC_FIELDS = {"action", "event", "type", "eventType", "event_type"}
+    # Fields whose values must NOT contribute to the embedding.
+    # Timestamps and IDs add high-DF tokens (every event re-emits the same
+    # date/minute/seconds) which dominate the SVD's top singular direction
+    # and collapse all queries onto one axis.
+    STOP_FIELDS = {"timestamp", "ts", "created_at", "updated_at", "time"}
 
     def tokenize_event(self, event: dict) -> list[str]:
-        """ 
+        """
         Tokenizes a Quorex user event dict.
 
         Rules :
-        - ATOMIC_FIELDS (action, type...) -> kept as single tokens, never split "viewed_pricing" stays "viewed_pricing"
-        - All other string fields -> normal tokenization "pro dashboard" -> ["pro", "dashboard"]
-        - Nested metadata -> normal tokenization on values
-
-        Example :
-        {
-            "action": "viewed_pricing",      → ["viewed_pricing"]
-            "userId": "user_123",            → ["user", "123"]
-            "metadata": {
-                "plan": "pro",               → ["pro"]
-                "source": "dashboard"        → ["dashboard"]
-            }
-        }
-        -> ["viewed_pricing", "user", "123", "pro", "dashboard"]
+        - ATOMIC_FIELDS (action, type...) -> kept as single tokens IF
+          the value has no whitespace (i.e. a snake_case event name like
+          "viewed_pricing"). Multi-word values are tokenized normally so
+          free-text use ({"action": "coucou bonjour"}) still produces
+          word-level overlap with the rest of the corpus.
+        - STOP_FIELDS (timestamp, ...) -> ignored entirely.
+        - All other string fields -> normal tokenization.
+        - Nested metadata -> recursively follows the same rules.
         """
         tokens = []
- 
+
         for key, value in event.items():
+            if key in self.STOP_FIELDS:
+                continue
             if isinstance(value, str):
-                if key in self.ATOMIC_FIELDS:
-                    # Keep as atomic token — just lowercase, no split
+                if key in self.ATOMIC_FIELDS and " " not in value.strip():
                     tokens.append(value.lower())
                 else:
                     tokens.extend(self.tokenize(value))
             elif isinstance(value, dict):
                 for k, v in value.items():
+                    if k in self.STOP_FIELDS:
+                        continue
                     if isinstance(v, str):
-                        if k in self.ATOMIC_FIELDS:
+                        if k in self.ATOMIC_FIELDS and " " not in v.strip():
                             tokens.append(v.lower())
                         else:
                             tokens.extend(self.tokenize(v))
- 
+
         return tokens
     
 if __name__ == "__main__":

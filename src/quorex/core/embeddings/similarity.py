@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 
 class SimilarityEngine:
@@ -37,7 +39,7 @@ class SimilarityEngine:
 
     # SEARCH
     def search(
-            self, query: np.ndarray, top_k: int = 5, threshold: float = 0.0
+            self, query: np.ndarray, top_k: int = 3, threshold: float = 0.7
     ) -> list[dict]:
         """ 
         Returns the top_k most similar vectors to the query.
@@ -98,8 +100,8 @@ class SimilarityEngine:
         return f"SimilarityEngine(stored={len(self)}, dims={dims})"
     
 if __name__ == "__main__":
-    from vectorizer import TFIDFVectorizer
-    from reducer import SVDReducer
+    from .vectorizer import TFIDFVectorizer
+    from .reducer import SVDReducer
  
     events = [
         {"action": "viewed_pricing", "metadata": {"plan": "pro", "source": "dashboard"}},

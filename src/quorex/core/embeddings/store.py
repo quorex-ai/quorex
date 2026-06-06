@@ -1,8 +1,8 @@
 import json
 import os
 import numpy as np
-from encoder import Encoder
-from similarity import SimilarityEngine
+from .encoder import Encoder
+from .similarity import SimilarityEngine
 
 
 class VectorStore:
@@ -163,6 +163,25 @@ class VectorStore:
 
     def __repr__(self) -> str:
         return f"VectorStore(path={self.path}, stored={len(self)})"
+
+    def refit(self, all_events: list[dict]) -> None:
+        """
+        Re-fits the encoder on all stored events.
+        Re-encodes all existing vectors with the new vocabulary.
+        Call this after fitting the encoder on new data to update the store's vectors.
+        """
+        self._check_ready()
+
+        self.encoder.fit(all_events)
+
+        new_vectors = []
+        new_metas = []
+
+        for meta in self.engine.metadata:
+            event = {k: v for k, v in meta.items() if k != "userId"}
+            vec = self.encoder.encode(event)
+            new_vectors.append(vec)
+            new_metas.append(meta)
 
 
 if __name__ == "__main__":

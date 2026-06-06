@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import numpy as np
 import os
-from tokenizer import Tokenizer
-from vectorizer import TFIDFVectorizer
-from reducer import SVDReducer
+from .tokenizer import Tokenizer
+from .vectorizer import TFIDFVectorizer
+from .reducer import SVDReducer
 
 
 class Encoder:
@@ -11,6 +13,9 @@ class Encoder:
         self.vectorizer = TFIDFVectorizer()
         self.reducer = SVDReducer(n_components=n_components)
         self.fitted = False
+        # Accumulated training corpus — kept so refit() can rebuild the
+        # SVD projection after the vocabulary has grown online.
+        self._training_events: list[dict] = []
 
     # ------------------------------------------------------------------
     # Fit
@@ -39,10 +44,44 @@ class Encoder:
         # Step 4 — fit reducer
         self.reducer.fit_transform(sparse, len(self.vectorizer.vocabulary))
 
+        # Keep training events so refit() can rebuild SVD with the
+        # combined corpus after partial_fit calls grow the vocabulary.
+        self._training_events: list[dict] = list(events)
+
         self.fitted = True
         print(f"Encoder fitted on {len(events)} events")
         print(f"  Vocabulary : {len(self.vectorizer.vocabulary)} tokens")
         print(f"  Output dims: {self.reducer.n_components}")
+
+    def partial_fit(self, events: list[dict]) -> int:
+        """
+        Online vocab + IDF update. Extends the reducer's projection with
+        a deterministic hashed column per new token so new tokens
+        contribute real signal to embeddings immediately — no refit
+        required for correctness (refit still sharpens quality on
+        accumulated data).
+
+        Returns the number of new vocab tokens added.
+        """
+        if not self.fitted:
+            self.fit(events)
+            return len(self.vectorizer.vocabulary)
+
+        new_tokens = self.vectorizer.partial_fit_events(events)
+        self.reducer.extend_vocab_with_tokens(new_tokens)
+        self._training_events.extend(events)
+        return len(new_tokens)
+
+    def refit(self) -> None:
+        """
+        Full retrain of the SVD projection on the accumulated corpus.
+        Call after many partial_fit batches when new-token embedding
+        quality matters.
+        """
+        if not self._training_events:
+            raise RuntimeError("Nothing to refit on — encoder has no training corpus.")
+        sparse = [self.vectorizer.transform_event(e) for e in self._training_events]
+        self.reducer.refit(sparse, len(self.vectorizer.vocabulary))
 
     # ------------------------------------------------------------------
     # Encode
@@ -114,7 +153,7 @@ class Encoder:
 
 
 if __name__ == "__main__":
-    from similarity import SimilarityEngine
+    from .similarity import SimilarityEngine
 
     # Training events
     events = [

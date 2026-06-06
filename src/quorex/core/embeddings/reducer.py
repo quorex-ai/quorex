@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import hashlib
 import json
 import os
 import numpy as np
@@ -63,6 +66,71 @@ class SVDReducer:
 
         return U[:, :k], s[:k], Vt[:k, :]
 
+    # ONLINE — vocab growth support
+
+    def _hashed_column(self, token: str) -> np.ndarray:
+        """
+        Deterministic pseudo-random column for a new vocab token.
+
+        Why: zero-padding new columns (the old behaviour) makes new tokens
+        invisible to the projection — every query containing only new
+        tokens produces a zero vector. Hashed random projection gives each
+        new token a stable, ~unit-norm, near-orthogonal direction in the
+        reduced space without requiring a refit. Same string always hashes
+        to the same column, so embeddings are reproducible across runs.
+        """
+        h = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        seed = int.from_bytes(h, "big") & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        col = rng.standard_normal(self.n_components)
+        if self.components is not None:
+            col = col.astype(self.components.dtype)
+        norm = np.linalg.norm(col)
+        if norm > 0:
+            col = col / norm
+        if self.components is not None and self.components.shape[1] > 0:
+            scale = float(np.median(np.linalg.norm(self.components, axis=0)))
+            if scale > 0:
+                col = col * scale
+        return col
+
+    def extend_vocab_with_tokens(self, new_tokens: list[str]) -> int:
+        """
+        Appends one column per new token to the projection matrix,
+        each populated with a deterministic hashed random vector. Lets
+        partial_fit produce meaningful embeddings for new tokens without
+        a refit.
+        """
+        if not self.fitted or self.components is None or not new_tokens:
+            return 0
+        cols = np.stack([self._hashed_column(t) for t in new_tokens], axis=1)
+        self.components = np.concatenate([self.components, cols], axis=1)
+        return len(new_tokens)
+
+    def extend_vocab(self, new_vocab_size: int) -> int:
+        """
+        Legacy zero-pad path. Kept for callers that don't have the new
+        token strings handy. Prefer extend_vocab_with_tokens — zero
+        columns make new tokens contribute nothing to embeddings.
+        """
+        if not self.fitted or self.components is None:
+            return 0
+        current = self.components.shape[1]
+        if new_vocab_size <= current:
+            return 0
+        pad = np.zeros((self.components.shape[0], new_vocab_size - current), dtype=self.components.dtype)
+        self.components = np.concatenate([self.components, pad], axis=1)
+        return new_vocab_size - current
+
+    def refit(self, vectors: list[dict[int, float]], vocab_size: int) -> np.ndarray:
+        """
+        Convenience alias for fit_transform — recomputes SVD components
+        from scratch on the supplied (typically accumulated) sparse
+        vectors. Use after many partial_fits when embedding quality for
+        new tokens matters.
+        """
+        return self.fit_transform(vectors, vocab_size)
+
     # TRANSFORM
     def transform(self, sparse_vector: dict[int, float], vocab_size: int) -> np.ndarray:
         """
@@ -71,8 +139,18 @@ class SVDReducer:
         """
         if not self.fitted:
             raise RuntimeError("Reducer must be fitted before calling transform()")
-        
-        dense = np.zeros(vocab_size)
+
+        # Empty sparse vector means zero overlap with vocabulary. Returning
+        # a zero vector breaks cosine similarity (norm=0) and poisons HNSW
+        # neighborhoods. Return a stable OOV direction instead so unknown
+        # queries cluster together rather than collapsing onto random
+        # neighbors.
+        if not sparse_vector:
+            oov = self._hashed_column("\x00__OOV__\x00")
+            n = np.linalg.norm(oov)
+            return oov / n if n > 0 else oov
+
+        dense = np.zeros(vocab_size, dtype=self.components.dtype)
         for idx, score in sparse_vector.items():
             dense[idx] = score
 
@@ -121,7 +199,7 @@ class SVDReducer:
         self.fitted = True
 
 if __name__ == "__main__":
-    from vectorizer import TFIDFVectorizer
+    from .vectorizer import TFIDFVectorizer
 
     events = [
         {"action": "viewed_pricing", "metadata": {"plan": "pro", "source": "dashboard"}},

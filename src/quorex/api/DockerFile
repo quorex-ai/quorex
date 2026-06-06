@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install numpy fastapi "uvicorn[standard]"
+RUN pip install -e .
+EXPOSE 8000
+CMD ["python", "src/quorex/api/run.py"]

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "quorex"
 version = "0.1.0"
 requires-python = ">=3.9"
-dependencies = ["numpy"]
+dependencies = ["numpy", "fastapi", "uvicorn[standard]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

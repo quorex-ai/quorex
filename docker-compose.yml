@@ -1,0 +1,21 @@
+services:
+  engine:
+    build: .
+    dockerfile: src/quorex/api/Dockerfile
+    container_name: quorex-engine
+    restart: always
+    environment:
+      QUOREX_INTERNAL_KEY: ${QUOREX_INTERNAL_KEY}
+      QUOREX_DB_PATH: /data/quorex_memory
+      QUOREX_ENCODER_PATH: /data/quorex_encoder
+    volumes:
+      - engine_data:/data
+    networks:
+      - quorex-network
+
+volumes:
+  engine_data:
+
+networks:
+  quorex-network:
+    external: true

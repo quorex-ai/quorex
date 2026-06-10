@@ -4,16 +4,18 @@ quorex.core.vectordb.quantizer
 Scalar quantization 8-bit (SQ8): float32 → uint8.
 4x memory reduction with minimal recall loss.
 
-Formula (per dimension d):
-  scale[d]  = (max[d] - min[d]) / 255
-  offset[d] = min[d]
-  q[d]      = clip(round((x[d] - offset[d]) / scale[d]), 0, 255).astype(uint8)
-  x̂[d]      = q[d] * scale[d] + offset[d]   ← reconstruction
+Factored asymmetric distance (the key optimization):
+  dot(q, decode(u)) = dot(q, u*scale + offset)
+                    = dot(q*scale, u) + dot(q, offset)
+                    = dot(q_scaled, u) + q_offset
+
+  q_scaled and q_offset are precomputed ONCE per query, so each per-node
+  distance is a single dot(q_scaled, u) over uint8 — no per-node decode,
+  no per-node float32 allocation. This is the FAISS trick.
 
 Asymmetric quantization:
   - Query vectors stay float32 (no loss on the query side)
   - Stored vectors are uint8
-  - Distance ≈ 1 − dot(query_f32, decode(stored_uint8))
 """
 
 from __future__ import annotations
@@ -23,111 +25,173 @@ import numpy as np
 
 
 class SQ8Quantizer:
-    def __init__(self) -> None:
-        self._scale:  np.ndarray | None = None   # (dim,) float32
-        self._offset: np.ndarray | None = None   # (dim,) float32 — per-dim min
+    def __init__(self, n_residual: int = 8) -> None:
+        self._scale:  np.ndarray | None = None
+        self._offset: np.ndarray | None = None
         self._fitted: bool = False
+        # Residual error compensation (Piste 2)
+        self.n_residual = n_residual
+        self._residual_basis: np.ndarray | None = None   # (R, dim) float32
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
     def fit(self, vectors: list[np.ndarray]) -> None:
-        """
-        Learns per-dimension min/max from a sample of float32 vectors.
-        All vectors must have the same dimensionality.
-        """
         if not vectors:
             raise ValueError("Cannot fit on empty vector list.")
 
-        matrix = np.stack(vectors, axis=0).astype(np.float32)  # (n, dim)
-        lo = matrix.min(axis=0)   # (dim,)
-        hi = matrix.max(axis=0)   # (dim,)
+        matrix = np.stack(vectors, axis=0).astype(np.float32)
+        lo = matrix.min(axis=0)
+        hi = matrix.max(axis=0)
 
         diff = hi - lo
-        # Prevent division by zero for constant dimensions (assign scale=1 so
-        # encode gives 0 and decode gives back the constant via offset).
         diff[diff == 0.0] = 1.0
 
         self._scale  = (diff / 255.0).astype(np.float32)
         self._offset = lo.astype(np.float32)
         self._fitted = True
 
+        # Residual basis on quantization errors — captures the principal
+        # directions of SQ8 error so the compensated distance can recover
+        # most of the quantization loss.
+        decoded = self.decode_batch(self.encode_batch(matrix))
+        errors = matrix - decoded
+        sample = errors[:2000]
+        _, _, Vt = np.linalg.svd(sample, full_matrices=False)
+        self._residual_basis = Vt[: self.n_residual].astype(np.float32)
+
     # ------------------------------------------------------------------
     # Encode / decode
     # ------------------------------------------------------------------
 
     def encode(self, vector: np.ndarray) -> np.ndarray:
-        """float32 → uint8.  Shape: (dim,) → (dim,)."""
         self._check_fitted()
         v = vector.astype(np.float32)
         q = (v - self._offset) / self._scale
         return np.clip(np.round(q), 0, 255).astype(np.uint8)
 
     def decode(self, quantized: np.ndarray) -> np.ndarray:
-        """uint8 → float32 (approximate reconstruction).  Shape preserved."""
         self._check_fitted()
         return quantized.astype(np.float32) * self._scale + self._offset
 
-    def encode_batch(self, vectors: list[np.ndarray] | np.ndarray) -> np.ndarray:
-        """float32 matrix (n, dim) → uint8 matrix (n, dim)."""
+    def encode_batch(self, vectors) -> np.ndarray:
         self._check_fitted()
-        m = np.stack(vectors, axis=0).astype(np.float32) if not isinstance(vectors, np.ndarray) else vectors.astype(np.float32)
+        m = (
+            np.stack(vectors, axis=0).astype(np.float32)
+            if not isinstance(vectors, np.ndarray)
+            else vectors.astype(np.float32)
+        )
         q = (m - self._offset) / self._scale
         return np.clip(np.round(q), 0, 255).astype(np.uint8)
 
     def decode_batch(self, quantized: np.ndarray) -> np.ndarray:
-        """uint8 matrix (n, dim) → float32 matrix (n, dim)."""
         self._check_fitted()
         return quantized.astype(np.float32) * self._scale + self._offset
 
     # ------------------------------------------------------------------
-    # Asymmetric distance
+    # FACTORED query preparation — the core optimization
     # ------------------------------------------------------------------
 
-    def asymmetric_distance(
-        self, query_f32: np.ndarray, stored_uint8: np.ndarray
+    def prepare_query(self, query_f32: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Precompute the factored query terms ONCE per search.
+
+        Returns:
+          q_scaled : query * scale            (float32, dim)  → dotted with uint8
+          q_offset : dot(query, offset)       (float scalar)  → constant per query
+
+        Then for any stored uint8 vector u:
+          dot(query, decode(u)) = dot(q_scaled, u) + q_offset
+        No decode, no per-node allocation.
+        """
+        self._check_fitted()
+        q = query_f32.astype(np.float32)
+        q_scaled = q * self._scale
+        q_offset = float(np.dot(q, self._offset))
+        return q_scaled, q_offset
+
+    def factored_distance(
+        self,
+        u: np.ndarray,
+        q_scaled: np.ndarray,
+        q_offset: float,
     ) -> float:
-        """
-        Fast dot-product proxy: dot(query_float32, decode(stored_uint8)).
+        """Cosine distance for one uint8 node via the factored form."""
+        dot = float(u @ q_scaled) + q_offset
+        return 1.0 - dot
 
-        Asymmetric: the query is NOT quantized (no loss on query side).
-        The stored vector is decoded inline — avoids allocating a full
-        float32 copy when only the dot product is needed.
+    def factored_distance_batch(
+        self,
+        U: np.ndarray,          # (k, dim) uint8
+        q_scaled: np.ndarray,   # (dim,) float32
+        q_offset: float,
+    ) -> np.ndarray:
+        """Cosine distance for a batch of uint8 nodes — one matmul, no decode."""
+        dots = U.astype(np.float32) @ q_scaled + q_offset   # (k,)
+        return 1.0 - dots
 
-        Returns the raw dot product (higher = more similar).
-        Use 1.0 − result for cosine distance.
-        """
+    # ------------------------------------------------------------------
+    # Residual compensation (Piste 2)
+    # ------------------------------------------------------------------
+
+    def encode_residual(self, vector: np.ndarray) -> np.ndarray:
+        self._check_fitted()
+        v = vector.astype(np.float32)
+        decoded = self.decode(self.encode(v))
+        e = v - decoded
+        return (self._residual_basis @ e).astype(np.float16)
+
+    def project_query(self, query_f32: np.ndarray) -> np.ndarray:
+        self._check_fitted()
+        return (self._residual_basis @ query_f32.astype(np.float32))
+
+    # ------------------------------------------------------------------
+    # Legacy non-factored distances (kept for _prune / greedy fallback)
+    # ------------------------------------------------------------------
+
+    def asymmetric_distance(self, query_f32, stored_uint8) -> float:
         self._check_fitted()
         decoded = stored_uint8.astype(np.float32) * self._scale + self._offset
         return float(np.dot(query_f32, decoded))
+
+    def compensated_distance(
+        self,
+        query_f32: np.ndarray,
+        stored_uint8: np.ndarray,
+        residual_f16: np.ndarray,
+        q_proj: np.ndarray,
+    ) -> float:
+        base = self.asymmetric_distance(query_f32, stored_uint8)
+        corr = float(np.dot(q_proj, residual_f16.astype(np.float32)))
+        return base + corr
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
     def save(self, path: str) -> None:
-        """Saves scale and offset to <path>.npz."""
         self._check_fitted()
         dirname = os.path.dirname(path)
         if dirname:
             os.makedirs(dirname, exist_ok=True)
-        np.savez(path, scale=self._scale, offset=self._offset)
+        np.savez(
+            path,
+            scale=self._scale,
+            offset=self._offset,
+            residual_basis=self._residual_basis,
+        )
 
     def load(self, path: str) -> None:
-        """Loads scale and offset from <path>.npz."""
         data = np.load(path + ".npz")
         self._scale  = data["scale"].astype(np.float32)
         self._offset = data["offset"].astype(np.float32)
+        if "residual_basis" in data:
+            self._residual_basis = data["residual_basis"].astype(np.float32)
         self._fitted = True
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
 
     @property
     def compression_ratio(self) -> float:
-        """Always 4.0 for SQ8 (float32 = 4 bytes, uint8 = 1 byte)."""
         return 4.0
 
     @property
@@ -142,14 +206,13 @@ class SQ8Quantizer:
         if not self._fitted:
             return "SQ8Quantizer(not fitted)"
         dim = len(self._scale)
-        return f"SQ8Quantizer(dim={dim}, compression=4x)"
+        return f"SQ8Quantizer(dim={dim}, compression=4x, residual_R={self.n_residual})"
 
 
 if __name__ == "__main__":
     rng = np.random.default_rng(42)
     dim = 64
 
-    # Simulate unit-normalized embeddings
     vecs = [rng.standard_normal(dim).astype(np.float32) for _ in range(500)]
     vecs = [v / np.linalg.norm(v) for v in vecs]
 
@@ -159,15 +222,11 @@ if __name__ == "__main__":
 
     v = vecs[0]
     enc = q.encode(v)
-    dec = q.decode(enc)
 
-    reconstruction_error = float(np.linalg.norm(v - dec))
-    cosine_before = float(np.dot(v, v))           # 1.0 (self)
-    cosine_after  = float(np.dot(v, dec))         # ≈ 1.0
-    asym_dot      = q.asymmetric_distance(v, enc)
-
-    print(f"Reconstruction L2 error : {reconstruction_error:.6f}")
-    print(f"Cosine (exact)          : {cosine_before:.6f}")
-    print(f"Cosine (decoded)        : {cosine_after:.6f}")
-    print(f"Asymmetric dot product  : {asym_dot:.6f}")
-    print(f"Compression ratio       : {q.compression_ratio}x")
+    # Verify factored distance == naive decode distance
+    q_scaled, q_offset = q.prepare_query(v)
+    factored = q.factored_distance(enc, q_scaled, q_offset)
+    naive = 1.0 - q.asymmetric_distance(v, enc)
+    print(f"Factored distance : {factored:.6f}")
+    print(f"Naive distance    : {naive:.6f}")
+    print(f"Difference        : {abs(factored - naive):.2e}  (should be ~0)")

@@ -1,30 +1,36 @@
 """
 quorex.core.vectordb.hnsw
 --------------------------
-Hierarchical Navigable Small World (HNSW) index.
-True Approximate Nearest Neighbor search in O(log n).
-
-Pure Python + numpy — no external dependencies.
-
-Based on: Malkov & Yashunin, 2018
+Bio-HNSW — HNSW index with:
+  - Factored asymmetric distance (precompute q_scaled/q_offset once per query)
+  - Batched beam search (one matmul per node-expansion instead of a Python loop)
+  - Quantization-aware construction (Piste 1)
+  - Residual error compensation (Piste 2)
+  - Bio-inspired periodic consolidation (bio_weight modulates distance)
 """
 
 from __future__ import annotations
 
-import numpy as np
 import math
-import random
 import heapq
+import random
+import time
 from dataclasses import dataclass, field
+
+import numpy as np
 
 
 @dataclass
 class HNSWNode:
     id: int
-    vector: np.ndarray | None          # float32, normalized; None when quantized
+    vector: np.ndarray | None
     neighbors: dict[int, list[int]] = field(default_factory=dict)
-    quantized: np.ndarray | None = None  # uint8 — set when SQ8 is active
-    # neighbors[layer] = [node_id, ...]
+    quantized: np.ndarray | None = None
+    residual: np.ndarray | None = None
+    timestamp: float = 0.0
+    reinforcements: int = 1
+    conflict_score: float = 0.0
+    bio_weight: float = 1.0
 
 
 class HNSWIndex:
@@ -36,72 +42,74 @@ class HNSWIndex:
         ef_search: int = 50,
         seed: int = 42,
         quantizer=None,
+        bio_enabled: bool = True,
     ):
-        """
-        dim             : vector dimensions
-        M               : max connections per node per layer
-        ef_construction : candidate list size during build (quality vs speed)
-        ef_search       : candidate list size during search (recall vs latency)
-                          lower ef_search = faster but less accurate (ANN)
-                          higher ef_search = slower but more accurate (→ KNN)
-        seed            : reproducibility — uses LOCAL random.Random instance
-                          so different HNSWIndex instances don't perturb each
-                          other's level sampling.
-        """
         self.dim = dim
         self.M = M
         self.M_max0 = M * 2
         self.ef_construction = ef_construction
         self.ef_search = ef_search
         self.ml = 1 / math.log(M)
+        self.bio_enabled = bio_enabled
 
         self.nodes: dict[int, HNSWNode] = {}
         self.entry_point: int | None = None
         self.max_layer: int = 0
 
-        # SQ8 quantizer — when set, vectors are stored as uint8 to save 4x RAM.
-        # Read-only after fit: no lock needed for concurrent reads.
         self.quantizer = quantizer
-
-        # Local RNG — does not affect global random / np.random state.
-        # Why: Segment creates one HNSWIndex per user. With a global seed,
-        # creating a new index would reset the global RNG and perturb all
-        # other indexes' _random_level() calls.
         self._seed = seed
         self._rng = random.Random(seed)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # Per-query factored terms (set in search()/insert(), reset after).
+        self._q_scaled: np.ndarray | None = None   # query * scale
+        self._q_offset: float = 0.0                 # dot(query, offset)
+        self._q_proj: np.ndarray | None = None      # residual projection
+        self._q_f32: np.ndarray | None = None       # raw float32 query (no quant)
 
-    def insert(self, id: int, vector: np.ndarray) -> None:
-        """Inserts a vector into the index.  Quantizes after wiring if SQ8 is active."""
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def insert(
+        self,
+        id: int,
+        vector: np.ndarray,
+        timestamp: float | None = None,
+        reinforcements: int = 1,
+    ) -> None:
         vector = self._normalize(vector)
-        node = HNSWNode(id=id, vector=vector)
+        node = HNSWNode(
+            id=id,
+            vector=vector,
+            timestamp=timestamp or time.time(),
+            reinforcements=reinforcements,
+            bio_weight=1.0,
+        )
         level = self._random_level()
         self.nodes[id] = node
 
-        # First node — initialize empty neighbor lists for all its layers.
+        # Piste 1 — quantize BEFORE wiring so the graph is built on the
+        # int8 distances used at search time.
+        if self.quantizer is not None:
+            node.quantized = self.quantizer.encode(vector)
+            node.residual = self.quantizer.encode_residual(vector)
+            node.vector = None
+            self._set_query(vector)
+
         if self.entry_point is None:
             for l in range(level + 1):
                 node.neighbors[l] = []
             self.entry_point = id
             self.max_layer = level
+            self._clear_query()
             return
 
-        # Pre-initialize neighbor lists for every layer this node lives on.
-        # Avoids the old bug where layers above max_layer were left
-        # uninitialized when the new node extended the index height.
         for l in range(level + 1):
             node.neighbors.setdefault(l, [])
 
         ep = self.entry_point
 
-        # Phase 1 — greedy descent above insertion level
         for l in range(self.max_layer, level, -1):
             ep = self._greedy_search(vector, ep, l)
 
-        # Phase 2 — beam search + connect at each level
         for l in range(min(level, self.max_layer), -1, -1):
             candidates = self._search_layer_heap(vector, ep, self.ef_construction, l)
             max_conn = self.M if l > 0 else self.M_max0
@@ -127,58 +135,45 @@ class HNSWIndex:
             self.max_layer = level
             self.entry_point = id
 
-        # Quantize after graph wiring — node.vector must be float32 throughout
-        # the insertion so _prune can read it from neighboring nodes.
-        if self.quantizer is not None:
-            node.quantized = self.quantizer.encode(node.vector)
-            node.vector = None
+        self._clear_query()
 
     def search(self, query: np.ndarray, top_k: int = 5) -> list[tuple[int, float]]:
-        """
-        ANN search — returns top_k nearest neighbors as (id, distance).
-        Distance = cosine distance (lower = more similar).
-
-        Two-phase when SQ8 is active:
-          Phase 1 — ANN with asymmetric uint8 distance (fast, approximate)
-          Phase 2 — exact rerank on decoded float32 (corrects quantization error)
-        """
         if self.entry_point is None:
             return []
 
         query = self._normalize(query)
-        ep = self.entry_point
+        self._set_query(query)
 
+        ep = self.entry_point
         for l in range(self.max_layer, 0, -1):
             ep = self._greedy_search(query, ep, l)
 
-        # Fetch more candidates in quantized mode so phase-2 rerank has room.
-        ef = max(self.ef_search, top_k * 2 if self.quantizer else top_k)
+        ef = max(self.ef_search, top_k * 4 if self.quantizer else top_k)
         candidates = self._search_layer_heap(query, ep, ef, 0)
 
         if self.quantizer is None:
+            self._clear_query()
             return candidates[:top_k]
 
-        # Phase 2 — exact rerank using decoded float32
-        reranked = []
-        for nid, _ in candidates:
-            node = self.nodes.get(nid)
-            if node is None:
-                continue
-            f32 = self._normalize(self._get_float32(node))
-            reranked.append((nid, self._dist(query, f32)))
-        reranked.sort(key=lambda x: x[1])
-        return reranked[:top_k]
+        # Phase 2 — rerank using the COMPENSATED distance (residual-corrected).
+        # The candidates already carry compensated distances from the beam
+        # search, but we recompute cleanly over the candidate set to get a
+        # tight final ordering. This uses the residual basis (Piste 2),
+        # recovering most of the SQ8 quantization error — the key to beating
+        # plain-int8 recall at equal M without keeping a float32 store.
+        cand_ids = [nid for nid, _ in candidates if nid in self.nodes]
+        if not cand_ids:
+            self._clear_query()
+            return []
 
+        dists = self._batch_node_dist(query, cand_ids)
+        order = np.argsort(dists)[:top_k]
+        out = [(cand_ids[i], float(dists[i])) for i in order]
+
+        self._clear_query()
+        return out
+        
     def delete(self, id: int) -> bool:
-        """
-        Hard delete — removes the node and detaches it from all neighbors.
-
-        Returns True if the node existed and was removed.
-
-        Note: HNSW does not natively support deletion without recall loss.
-        For accuracy-critical workloads, prefer rebuilding the index via
-        rebuild_from(...) after a batch of deletes.
-        """
         if id not in self.nodes:
             return False
 
@@ -193,8 +188,6 @@ class HNSWIndex:
                 if lst and id in lst:
                     lst.remove(id)
 
-        # If we removed the entry point, pick a new one from the highest
-        # remaining layer. If the index is empty, reset entirely.
         if self.entry_point == id:
             if not self.nodes:
                 self.entry_point = None
@@ -215,48 +208,54 @@ class HNSWIndex:
         return True
 
     def update(self, id: int, vector: np.ndarray) -> bool:
-        """
-        Updates a node's vector by deleting + re-inserting.
-
-        Returns True if the node existed.
-
-        Re-insert is required because changing a vector invalidates
-        the existing graph neighborhoods (they were chosen against the
-        old vector).
-        """
         if id not in self.nodes:
             return False
+        old = self.nodes.get(id)
+        ts = old.timestamp if old else time.time()
+        reinforcements = old.reinforcements if old else 1
         self.delete(id)
-        self.insert(id, vector)
+        self.insert(id, vector, timestamp=ts, reinforcements=reinforcements)
         return True
 
     def enable_quantization(self, quantizer) -> None:
-        """
-        Quantizes all existing float32 vectors in-place to uint8.
-        Sets the quantizer so future inserts are also quantized.
-        """
         self.quantizer = quantizer
         n = 0
         for node in self.nodes.values():
             if node.vector is not None:
+                node.residual = quantizer.encode_residual(node.vector)
                 node.quantized = quantizer.encode(node.vector)
                 node.vector = None
                 n += 1
-        print(f"Quantized {n} vectors — RAM reduced by 4x")
+        print(f"Quantized {n} vectors with residual compensation (R={quantizer.n_residual})")
 
-    def rebuild_from(self, ids_and_vectors: list[tuple[int, np.ndarray]]) -> None:
-        """
-        Clears the index and rebuilds from a list of (id, vector).
-
-        Used by the segment layer for periodic compaction after many
-        soft-deletes / updates have degraded graph quality.
-        """
+    def rebuild_from(
+        self,
+        ids_and_vectors: list[tuple[int, np.ndarray]],
+        bio_meta: dict[int, dict] | None = None,
+    ) -> None:
         self.nodes.clear()
         self.entry_point = None
         self.max_layer = 0
         self._rng = random.Random(self._seed)
+
         for id, vec in ids_and_vectors:
-            self.insert(id, vec)
+            meta = bio_meta.get(id, {}) if bio_meta else {}
+            self.insert(
+                id, vec,
+                timestamp=meta.get("timestamp", time.time()),
+                reinforcements=meta.get("reinforcements", 1),
+            )
+            if bio_meta and id in bio_meta:
+                node = self.nodes.get(id)
+                if node:
+                    node.conflict_score = meta.get("conflict_score", 0.0)
+                    node.bio_weight = meta.get("bio_weight", 1.0)
+
+    def apply_bio_weights(self, weights: dict[int, float]) -> None:
+        for vec_id, w in weights.items():
+            node = self.nodes.get(vec_id)
+            if node is not None:
+                node.bio_weight = max(0.0, min(1.0, w))
 
     def __len__(self) -> int:
         return len(self.nodes)
@@ -264,18 +263,14 @@ class HNSWIndex:
     def __repr__(self) -> str:
         return (
             f"HNSWIndex(nodes={len(self)}, dim={self.dim}, "
-            f"M={self.M}, ef_search={self.ef_search}, layers={self.max_layer + 1})"
+            f"M={self.M}, ef_search={self.ef_search}, "
+            f"bio={'on' if self.bio_enabled else 'off'}, "
+            f"layers={self.max_layer + 1})"
         )
 
-    # ------------------------------------------------------------------
-    # Persistence — topology only. Vectors live in storage.vectors.bin.
-    # ------------------------------------------------------------------
+    # ── Persistence ──────────────────────────────────────────────────────
 
     def topology_dict(self) -> dict:
-        """
-        Returns the graph topology (no vectors) as a JSON-serializable dict.
-        Lets storage.load() rebuild the graph in O(n) without re-inserting.
-        """
         return {
             "dim": self.dim,
             "M": self.M,
@@ -284,8 +279,15 @@ class HNSWIndex:
             "seed": self._seed,
             "entry_point": self.entry_point,
             "max_layer": self.max_layer,
+            "bio_enabled": self.bio_enabled,
             "nodes": {
-                str(nid): {str(layer): nb for layer, nb in node.neighbors.items()}
+                str(nid): {
+                    "neighbors": {str(layer): nb for layer, nb in node.neighbors.items()},
+                    "timestamp": node.timestamp,
+                    "reinforcements": node.reinforcements,
+                    "conflict_score": node.conflict_score,
+                    "bio_weight": node.bio_weight,
+                }
                 for nid, node in self.nodes.items()
             },
         }
@@ -297,12 +299,6 @@ class HNSWIndex:
         vectors_by_id: dict[int, np.ndarray],
         quantizer=None,
     ) -> "HNSWIndex":
-        """
-        Reconstructs an HNSWIndex from a topology dict + a vector map.
-
-        quantizer : if provided, vectors_by_id contains uint8 arrays and are
-                    stored as quantized (node.vector = None, node.quantized set).
-        """
         idx = cls(
             dim=topology["dim"],
             M=topology["M"],
@@ -310,38 +306,73 @@ class HNSWIndex:
             ef_search=topology["ef_search"],
             seed=topology["seed"],
             quantizer=quantizer,
+            bio_enabled=topology.get("bio_enabled", True),
         )
         idx.entry_point = topology["entry_point"]
         idx.max_layer = topology["max_layer"]
-        for nid_str, layer_map in topology["nodes"].items():
+
+        for nid_str, node_data in topology["nodes"].items():
             nid = int(nid_str)
             vec = vectors_by_id.get(nid)
             if vec is None:
                 continue
+
+            if isinstance(node_data, dict) and "neighbors" in node_data:
+                layer_map = node_data["neighbors"]
+                ts = node_data.get("timestamp", 0.0)
+                reinforcements = node_data.get("reinforcements", 1)
+                conflict_score = node_data.get("conflict_score", 0.0)
+                bio_weight = node_data.get("bio_weight", 1.0)
+            else:
+                layer_map = node_data
+                ts = 0.0
+                reinforcements = 1
+                conflict_score = 0.0
+                bio_weight = 1.0
+
             neighbors = {int(layer): list(nb) for layer, nb in layer_map.items()}
+
             if quantizer is not None:
+                decoded = quantizer.decode(vec) if vec.dtype == np.uint8 else vec
+                residual = quantizer.encode_residual(decoded)
                 idx.nodes[nid] = HNSWNode(
-                    id=nid,
-                    vector=None,
-                    neighbors=neighbors,
-                    quantized=vec,  # already uint8
+                    id=nid, vector=None, neighbors=neighbors,
+                    quantized=vec, residual=residual,
+                    timestamp=ts, reinforcements=reinforcements,
+                    conflict_score=conflict_score, bio_weight=bio_weight,
                 )
             else:
                 idx.nodes[nid] = HNSWNode(
-                    id=nid,
-                    vector=idx._normalize(vec),
-                    neighbors=neighbors,
+                    id=nid, vector=idx._normalize(vec), neighbors=neighbors,
+                    timestamp=ts, reinforcements=reinforcements,
+                    conflict_score=conflict_score, bio_weight=bio_weight,
                 )
         return idx
 
-    # ------------------------------------------------------------------
-    # Core — heapq-based ANN search
-    # ------------------------------------------------------------------
+    # ── Query setup ──────────────────────────────────────────────────────
+
+    def _set_query(self, query_f32: np.ndarray) -> None:
+        """Precompute factored terms ONCE per query."""
+        self._q_f32 = query_f32
+        if self.quantizer is not None:
+            self._q_scaled, self._q_offset = self.quantizer.prepare_query(query_f32)
+            self._q_proj = self.quantizer.project_query(query_f32)
+        else:
+            self._q_scaled = None
+            self._q_offset = 0.0
+            self._q_proj = None
+
+    def _clear_query(self) -> None:
+        self._q_scaled = None
+        self._q_offset = 0.0
+        self._q_proj = None
+        self._q_f32 = None
+
+    # ── Core search ──────────────────────────────────────────────────────
 
     def _search_layer_heap(
         self, query: np.ndarray, ep_id: int, ef: int, layer: int
     ) -> list[tuple[int, float]]:
-        """True ANN beam search using binary heaps (heapq)."""
         ep_dist = self._node_dist(query, self.nodes[ep_id])
         visited = {ep_id}
 
@@ -353,24 +384,27 @@ class HNSWIndex:
 
         while candidates:
             c_dist, c_id = heapq.heappop(candidates)
-
             worst_result_dist = -results[0][0]
             if c_dist > worst_result_dist:
                 break
 
-            for n_id in self.nodes[c_id].neighbors.get(layer, []):
-                if n_id in visited:
-                    continue
-                visited.add(n_id)
-                if n_id not in self.nodes:
-                    continue
-                n_dist = self._node_dist(query, self.nodes[n_id])
-                worst = -results[0][0]
+            # Collect unvisited neighbors, then batch their distances.
+            neigh = [
+                n_id for n_id in self.nodes[c_id].neighbors.get(layer, [])
+                if n_id not in visited and n_id in self.nodes
+            ]
+            if not neigh:
+                continue
+            visited.update(neigh)
 
+            dists = self._batch_node_dist(query, neigh)
+
+            for n_id, nd in zip(neigh, dists):
+                n_dist = float(nd)
+                worst = -results[0][0]
                 if n_dist < worst or len(results) < ef:
                     heapq.heappush(candidates, (n_dist, n_id))
                     heapq.heappush(results, (-n_dist, n_id))
-
                     if len(results) > ef:
                         heapq.heappop(results)
 
@@ -378,38 +412,69 @@ class HNSWIndex:
         out.sort(key=lambda x: x[0])
         return [(nid, dist) for dist, nid in out]
 
+    def _batch_node_dist(self, query: np.ndarray, node_ids: list[int]) -> np.ndarray:
+        """
+        Distances for many nodes in one matmul.
+        Quantized path uses the factored form (no per-node decode).
+        """
+        if self.quantizer is not None and self._q_scaled is not None:
+            U = np.stack([self.nodes[n].quantized for n in node_ids])  # (k, dim) uint8
+            d = self.quantizer.factored_distance_batch(
+                U, self._q_scaled, self._q_offset
+            )
+            # Residual compensation in batch
+            if self._q_proj is not None:
+                residuals = [self.nodes[n].residual for n in node_ids]
+                if all(r is not None for r in residuals):
+                    R = np.stack(residuals).astype(np.float32)  # (k, R)
+                    d = d - (R @ self._q_proj)
+        else:
+            V = np.stack([self.nodes[n].vector for n in node_ids])
+            d = 1.0 - (V @ query)
+
+        if self.bio_enabled:
+            w = np.fromiter(
+                (self.nodes[n].bio_weight for n in node_ids),
+                dtype=np.float32, count=len(node_ids),
+            )
+            if np.any(w < 1.0):
+                d = d * (2.0 - w)
+
+        return d
+
     def _greedy_search(self, query: np.ndarray, ep_id: int, layer: int) -> int:
-        """Single-step greedy descent for upper layers."""
         current = ep_id
         current_dist = self._node_dist(query, self.nodes[current])
 
         improved = True
         while improved:
             improved = False
-            for n_id in self.nodes[current].neighbors.get(layer, []):
-                if n_id not in self.nodes:
-                    continue
-                d = self._node_dist(query, self.nodes[n_id])
-                if d < current_dist:
-                    current, current_dist = n_id, d
-                    improved = True
+            neigh = [
+                n_id for n_id in self.nodes[current].neighbors.get(layer, [])
+                if n_id in self.nodes
+            ]
+            if not neigh:
+                break
+            dists = self._batch_node_dist(query, neigh)
+            best_idx = int(np.argmin(dists))
+            if float(dists[best_idx]) < current_dist:
+                current = neigh[best_idx]
+                current_dist = float(dists[best_idx])
+                improved = True
 
         return current
 
-    def _prune(self, vector: np.ndarray, neighbor_ids: list[int], max_conn: int) -> list[int]:
-        """Keeps max_conn closest neighbors using a heap.
-        `vector` is always float32 (the center node's vector during insert)."""
-        heap = [
-            (self._node_dist(vector, self.nodes[n]), n)
-            for n in neighbor_ids
-            if n in self.nodes
-        ]
-        heapq.heapify(heap)
-        return [heapq.heappop(heap)[1] for _ in range(min(max_conn, len(heap)))]
+    def _prune(
+        self, vector: np.ndarray, neighbor_ids: list[int], max_conn: int
+    ) -> list[int]:
+        ids = [n for n in neighbor_ids if n in self.nodes]
+        if not ids:
+            return []
+        dists = self._batch_node_dist(vector, ids)
+        order = np.argsort(dists)[:max_conn]
+        return [ids[i] for i in order]
 
-    # ------------------------------------------------------------------
-    # Utils
-    # ------------------------------------------------------------------
+    # ── Utils ─────────────────────────────────────────────────────────────
 
     def _random_level(self) -> int:
         return int(-math.log(self._rng.random()) * self.ml)
@@ -417,76 +482,31 @@ class HNSWIndex:
     def _dist(self, a: np.ndarray, b: np.ndarray) -> float:
         return float(1.0 - np.dot(a, b))
 
-    def _node_dist(self, query: np.ndarray, node: "HNSWNode") -> float:
-        """
-        Cosine distance between a float32 query and a node.
-        Uses asymmetric uint8 distance when quantizer is active (Phase 1).
-        Falls back to exact float32 dot otherwise.
-        """
+    def _node_dist(self, query: np.ndarray, node: HNSWNode) -> float:
+        """Single-node distance — used for entry points only now."""
         if self.quantizer is not None and node.quantized is not None:
-            return 1.0 - self.quantizer.asymmetric_distance(query, node.quantized)
-        return self._dist(query, node.vector)
+            if self._q_scaled is not None:
+                dot = float(node.quantized @ self._q_scaled) + self._q_offset
+                if node.residual is not None and self._q_proj is not None:
+                    dot += float(node.residual.astype(np.float32) @ self._q_proj)
+                cosine_d = 1.0 - dot
+            else:
+                cosine_d = 1.0 - self.quantizer.asymmetric_distance(
+                    query, node.quantized
+                )
+        else:
+            cosine_d = self._dist(query, node.vector)
 
-    def _get_float32(self, node: "HNSWNode") -> np.ndarray:
-        """Returns the float32 vector for a node, decoding from uint8 if needed."""
+        if self.bio_enabled and node.bio_weight < 1.0:
+            return cosine_d * (2.0 - node.bio_weight)
+
+        return cosine_d
+
+    def _get_float32(self, node: HNSWNode) -> np.ndarray:
         if node.vector is not None:
             return node.vector
         return self.quantizer.decode(node.quantized)
 
     def _normalize(self, v: np.ndarray) -> np.ndarray:
-        norm = np.linalg.norm(v)
+        norm = float(np.linalg.norm(v))
         return v / norm if norm > 0 else v
-
-
-if __name__ == "__main__":
-    import time
-    from quorex.core.embeddings.encoder import Encoder
-
-
-    print("Building HNSW index (ANN)...\n")
-
-    events = [
-        {"action": "viewed_pricing", "metadata": {"plan": "pro", "source": "dashboard"}},
-        {"action": "searched_pricing", "metadata": {"query": "pricing", "source": "web"}},
-        {"action": "upgraded_plan", "metadata": {"plan": "pro", "source": "billing"}},
-        {"action": "visited_homepage", "metadata": {"source": "organic"}},
-        {"action": "clicked_cta", "metadata": {"source": "dashboard", "plan": "pro"}},
-        {"action": "viewed_pricing", "metadata": {"plan": "starter", "source": "email"}},
-        {"action": "opened_onboarding", "metadata": {"source": "welcome_email"}},
-        {"action": "searched_docs", "metadata": {"query": "api reference", "source": "docs"}},
-    ]
-
-    encoder = Encoder(n_components=8)
-    encoder.fit(events)
-
-    index = HNSWIndex(dim=8, M=4, ef_construction=20, ef_search=10)
-    for i, event in enumerate(events):
-        index.insert(i, encoder.encode(event))
-
-    print(index)
-
-    query = {"action": "viewed_pricing", "metadata": {"plan": "pro"}}
-    query_vec = encoder.encode(query)
-
-    N = 1000
-    t0 = time.perf_counter()
-    for _ in range(N):
-        results = index.search(query_vec, top_k=3)
-    t1 = time.perf_counter()
-
-    avg_ms = (t1 - t0) / N * 1000
-    print(f"\nLatency: {avg_ms:.3f}ms avg over {N} queries")
-    print("\nTop 3 results:")
-    for node_id, dist in results:
-        print(f"  id={node_id} similarity={round(1-dist, 4)} → {events[node_id]['action']}")
-
-    # Hard delete + update demo
-    print("\n--- Hard delete id=0 ---")
-    index.delete(0)
-    for node_id, dist in index.search(query_vec, top_k=3):
-        print(f"  id={node_id} similarity={round(1-dist, 4)} → {events[node_id]['action']}")
-
-    print("\n--- Update id=1 with new vector ---")
-    new_vec = encoder.encode({"action": "totally_different", "metadata": {"x": "y"}})
-    index.update(1, new_vec)
-    print(f"  index now: {index}")

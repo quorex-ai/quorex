@@ -1,0 +1,16 @@
+config,n_vectors,ram_mb,p50_ms,p95_ms,p99_ms,recall_at_10,throughput_rps
+Baseline (HNSW float32),1000,2.06,1.0296,1.3521,1.5657,0.9805,932.36
+Baseline (HNSW float32),1778,3.61,1.1058,1.2261,1.3118,0.934,895.06
+Baseline (HNSW float32),3162,6.17,1.3337,1.5401,1.6878,0.8685,739.05
+Baseline (HNSW float32),5623,10.75,1.5306,1.8865,2.1638,0.7585,635.45
+Baseline (HNSW float32),10000,18.39,1.9962,2.4623,2.7363,0.6305,496.43
+"GAFAM (int8 basique + reranking float32, RAM réelle)",1000,6.15,3.3592,3.6479,3.8154,1.0,294.7
+"GAFAM (int8 basique + reranking float32, RAM réelle)",1778,10.71,4.479,5.0102,5.816,1.0,219.22
+"GAFAM (int8 basique + reranking float32, RAM réelle)",3162,14.74,5.6474,6.2006,6.8284,0.992,174.68
+"GAFAM (int8 basique + reranking float32, RAM réelle)",5623,20.52,8.099,11.564,14.4277,0.976,117.5
+"GAFAM (int8 basique + reranking float32, RAM réelle)",10000,30.29,12.156,16.6989,18.289,0.9315,78.61
+Quorex (Piste1 + Piste2 + reranking compensé),1000,5.55,2.2734,2.4766,2.9104,0.9705,432.15
+Quorex (Piste1 + Piste2 + reranking compensé),1778,9.65,2.5985,2.8798,3.1369,0.927,380.33
+Quorex (Piste1 + Piste2 + reranking compensé),3162,14.69,2.9278,3.4892,3.7063,0.863,334.34
+Quorex (Piste1 + Piste2 + reranking compensé),5623,24.35,3.7364,4.917,5.8162,0.7575,262.86
+Quorex (Piste1 + Piste2 + reranking compensé),10000,42.71,3.8924,4.6447,4.8827,0.6285,252.76

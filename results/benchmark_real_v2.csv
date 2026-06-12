@@ -1,0 +1,31 @@
+engine,implementation,n_vectors,ram_mb,p50_ms,p95_ms,p99_ms,recall_at_10,throughput_rps
+Quorex-Baseline (HNSW float32),Python,1000,1.43,1.3636,2.1376,2.3425,1.0,692.43
+Quorex-Baseline (HNSW float32),Python,1778,2.57,1.6511,2.4623,2.7643,1.0,571.51
+Quorex-Baseline (HNSW float32),Python,3162,4.41,2.0886,3.1692,3.6448,0.998,451.73
+Quorex-Baseline (HNSW float32),Python,5623,7.69,2.6391,3.4817,3.8492,0.9975,375.17
+Quorex-Baseline (HNSW float32),Python,10000,13.24,3.5898,5.5675,7.1115,0.9885,266.61
+Quorex (int8 + Piste1 + Piste2),Python,1000,3.67,2.91,3.9106,4.2498,0.9795,337.14
+Quorex (int8 + Piste1 + Piste2),Python,1778,6.41,3.6512,5.1074,6.1014,0.9685,267.78
+Quorex (int8 + Piste1 + Piste2),Python,3162,7.2,4.2583,5.4128,5.7557,0.955,229.77
+Quorex (int8 + Piste1 + Piste2),Python,5623,7.2,4.6506,5.934,6.6141,0.922,211.28
+Quorex (int8 + Piste1 + Piste2),Python,10000,10.81,5.9875,7.1396,7.4995,0.895,169.82
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,1000,3.67,3.8908,5.0391,5.6523,0.986,249.11
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,1778,6.41,5.3795,7.1578,8.2395,0.9825,179.03
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,3162,7.2,6.1125,7.9215,8.9078,0.978,158.61
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,5623,7.2,7.1673,8.7766,9.6999,0.9515,137.72
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,10000,10.97,7.8282,10.457,11.4221,0.923,123.73
+hnswlib (C++ float32),C++,1000,0.04,0.0393,0.0557,0.0835,1.0,23362.03
+hnswlib (C++ float32),C++,1778,0.07,0.0485,0.0698,0.1142,0.999,18700.33
+hnswlib (C++ float32),C++,3162,0.14,0.0628,0.0762,0.1138,0.9975,15489.23
+hnswlib (C++ float32),C++,5623,0.25,0.0624,0.1074,0.1837,0.992,14466.55
+hnswlib (C++ float32),C++,10000,0.45,0.0626,0.0862,0.1142,0.967,14646.44
+"FAISS IndexHNSWFlat (Meta, C++)",C++,1000,0.49,0.0591,0.0925,0.2146,0.9985,14604.62
+"FAISS IndexHNSWFlat (Meta, C++)",C++,1778,0.87,0.0711,0.1074,0.5095,0.999,12191.55
+"FAISS IndexHNSWFlat (Meta, C++)",C++,3162,1.55,0.0769,0.0973,0.5031,0.998,11501.92
+"FAISS IndexHNSWFlat (Meta, C++)",C++,5623,2.75,0.0816,0.1163,0.1998,0.996,11432.03
+"FAISS IndexHNSWFlat (Meta, C++)",C++,10000,4.88,0.0753,0.0972,0.1307,0.9765,11468.09
+"FAISS IVF+SQ8 (Meta, C++)",C++,1000,0.98,0.0318,0.0417,0.092,0.529,28336.64
+"FAISS IVF+SQ8 (Meta, C++)",C++,1778,1.74,0.0424,0.0543,0.0901,0.477,21575.9
+"FAISS IVF+SQ8 (Meta, C++)",C++,3162,3.09,0.0654,0.0915,0.1518,0.468,14216.36
+"FAISS IVF+SQ8 (Meta, C++)",C++,5623,5.49,0.1104,0.2114,0.7614,0.4435,5352.33
+"FAISS IVF+SQ8 (Meta, C++)",C++,10000,9.77,0.1674,0.1915,0.3073,0.4375,5747.04

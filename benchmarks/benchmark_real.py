@@ -4,15 +4,12 @@ benchmarks/benchmark_real.py
 Benchmark multi-engine : Quorex vs hnswlib vs FAISS.
 
 Engines comparés :
-  1. Quorex-Baseline  — HNSW float32 Python (référence)
-  2. Quorex           — HNSW int8 + Piste1 + Piste2 (notre contribution)
-  3. hnswlib           — HNSW float32 C++ (auteur original, référence C++)
-  4. FAISS HNSWFlat   — HNSW float32 Meta (référence académique)
-  5. FAISS IVF+SQ8    — IVF + SQ8 Meta (approche industrie)
-
-Tous les engines utilisent M=16, ef=50 pour une comparaison algorithmique équitable.
-La latence C++ vs Python est notée explicitement — pas de prétention à gagner sur la
-vitesse brute en Python pur.
+  1. Quorex-Baseline   — HNSW float32 Python (référence)
+  2. Quorex            — HNSW int8 + Piste1 + Piste2 ef=50 R=8
+  3. Quorex-Optimized  — HNSW int8 + Piste1 + Piste2 ef=80 R=16
+  4. hnswlib            — HNSW float32 C++ (auteur original)
+  5. FAISS HNSWFlat    — HNSW float32 Meta (référence académique)
+  6. FAISS IVF+SQ8     — IVF + SQ8 Meta (approche industrie)
 
 Usage :
   python -m benchmarks.benchmark_real --max-n 10000 --steps 5
@@ -35,7 +32,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from benchmarks.engines.engine_quorex_baseline import QuorexBaselineEngine
-from benchmarks.engines.engine_quorex         import QuorexEngine
+from benchmarks.engines.engine_quorex         import QuorexEngine, QuorexOptimizedEngine
 from benchmarks.engines.engine_hnswlib         import HnswlibEngine
 from benchmarks.engines.engine_faiss_flat      import FaissHNSWFlatEngine
 from benchmarks.engines.engine_faiss_sq8       import FaissIVFSQ8Engine
@@ -55,7 +52,7 @@ class BenchmarkPoint:
     p99_ms:         float
     recall_at_10:   float
     throughput_rps: float
-    implementation: str   # "Python" ou "C++"
+    implementation: str
 
 @dataclass
 class EngineResult:
@@ -65,10 +62,6 @@ class EngineResult:
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 def generate_dataset(n: int, dim: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    n vecteurs normalisés + 200 requêtes tirées du corpus.
-    Garantit de vrais voisins à retrouver pour un recall correct.
-    """
     rng = np.random.default_rng(SEED)
     vecs = rng.standard_normal((n, dim)).astype(np.float32)
     vecs /= np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-8)
@@ -84,9 +77,7 @@ def ground_truth(vecs: np.ndarray, queries: np.ndarray, k: int = 10) -> np.ndarr
     scores = queries @ vecs.T
     return np.argsort(-scores, axis=1)[:, :k]
 
-def recall_at_k(
-    retrieved: list[list[int]], gt: np.ndarray, k: int = 10
-) -> float:
+def recall_at_k(retrieved: list[list[int]], gt: np.ndarray, k: int = 10) -> float:
     hits = total = 0
     for ret, g in zip(retrieved, gt):
         hits  += len(set(ret[:k]) & set(g[:k].tolist()))
@@ -95,22 +86,11 @@ def recall_at_k(
 
 # ── Benchmark d'un engine ─────────────────────────────────────────────────────
 
-def bench_engine(
-    engine,
-    vecs: np.ndarray,
-    queries: np.ndarray,
-    gt: np.ndarray,
-    n: int,
-    k: int = 10,
-    impl: str = "Python",
-) -> BenchmarkPoint:
+def bench_engine(engine, vecs, queries, gt, n, k=10, impl="Python") -> BenchmarkPoint:
     gc.collect()
-
-    # Build
     engine.build(vecs[:n])
     ram = engine.ram_mb()
 
-    # Search
     lats, retrieved = [], []
     for q in queries:
         t0 = time.perf_counter()
@@ -135,33 +115,22 @@ def bench_engine(
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
-def run_suite(
-    dim: int = 128,
-    max_n: int = 10_000,
-    steps: int = 5,
-    k: int = 10,
-    M: int = 16,
-    ef: int = 50,
-) -> list[EngineResult]:
-
+def run_suite(dim=128, max_n=10_000, steps=5, k=10, M=16, ef=50) -> list[EngineResult]:
     ns = np.geomspace(1_000, max_n, steps).astype(int).tolist()
 
-    # Définit les engines avec les mêmes paramètres M et ef
     engines_cfg = [
-        (QuorexBaselineEngine(M=M, ef_construction=200, ef_search=ef), "Python"),
-        (QuorexEngine(M=M, ef_construction=200, ef_search=ef),         "Python"),
-        (HnswlibEngine(M=M, ef_construction=200, ef_search=ef),        "C++"),
-        (FaissHNSWFlatEngine(M=M, ef_search=ef),                       "C++"),
+        (QuorexBaselineEngine(M=M, ef_construction=200, ef_search=ef),   "Python"),
+        (QuorexEngine(M=M, ef_construction=200, ef_search=ef),            "Python"),
+        (QuorexOptimizedEngine(M=M, ef_construction=200),                 "Python"),
+        (HnswlibEngine(M=M, ef_construction=200, ef_search=ef),           "C++"),
+        (FaissHNSWFlatEngine(M=M, ef_search=ef),                          "C++"),
         (FaissIVFSQ8Engine(nlist=max(4, min(100, max_n//10)), nprobe=10), "C++"),
     ]
 
     results = {e.name: EngineResult(name=e.name) for e, _ in engines_cfg}
 
     print(f"\n{'='*76}")
-    print(
-        f"  BENCHMARK RÉEL  |  dim={dim}  max_n={max_n:,}  "
-        f"k={k}  M={M}  ef={ef}"
-    )
+    print(f"  BENCHMARK RÉEL  |  dim={dim}  max_n={max_n:,}  k={k}  M={M}  ef={ef}")
     print(f"{'='*76}\n")
     print("Engines :")
     for e, impl in engines_cfg:
@@ -170,7 +139,6 @@ def run_suite(
     for n in ns:
         vecs, queries = generate_dataset(n, dim)
         gt = ground_truth(vecs, queries, k)
-
         print(f"\n── N = {n:>7,} vectors  ({len(queries)} queries) ──────────────────")
 
         for engine, impl in engines_cfg:
@@ -215,24 +183,19 @@ def print_report(results: list[EngineResult], k: int = 10) -> None:
                 f"{pt.throughput_rps:>8.1f}"
             )
 
-    # Comparaison au point max
     print(f"\n{'='*76}")
     print("  COMPARAISON AU POINT MAXIMUM")
     print(f"{'='*76}")
 
-    last = {
-        res.name: res.points[-1]
-        for res in results
-        if res.points
-    }
+    last = {res.name: res.points[-1] for res in results if res.points}
     if not last:
         return
 
-    print(f"\n{'Engine':<45} {'Impl':>6} {'RAM':>8} {'p50':>8} {'p99':>8} {'Recall':>8} {'RPS':>8}")
-    print("-" * 95)
+    print(f"\n{'Engine':<50} {'Impl':>6} {'RAM':>8} {'p50':>8} {'p99':>8} {'Recall':>8} {'RPS':>8}")
+    print("-" * 100)
     for name, pt in sorted(last.items(), key=lambda x: -x[1].recall_at_10):
         print(
-            f"{name:<45} {pt.implementation:>6} "
+            f"{name:<50} {pt.implementation:>6} "
             f"{pt.ram_mb:>7.1f}MB "
             f"{pt.p50_ms:>7.3f}ms "
             f"{pt.p99_ms:>7.3f}ms "
@@ -240,24 +203,34 @@ def print_report(results: list[EngineResult], k: int = 10) -> None:
             f"{pt.throughput_rps:>7.0f}"
         )
 
-    print(f"\n  Note: la latence Python est ~10-20x plus haute que C++ par construction.")
-    print(f"  La comparaison équitable est le RECALL et la RAM à M et ef identiques.")
+    print(f"\n  Note: latence Python ~10-20x plus haute que C++ par construction.")
+    print(f"  Comparaison équitable = RECALL et RAM à M et ef identiques.")
 
-    # Trouve Quorex et hnswlib pour la comparaison recall/RAM
-    quorex = last.get("Quorex (int8 + Piste1 + Piste2)")
-    hnswlib_e = last.get("hnswlib (C++ float32)")
-    faiss_flat = last.get("FAISS IndexHNSWFlat (Meta, C++)")
+    # Comparaisons clés
+    qbase   = last.get("Quorex-Baseline (HNSW float32)")
+    q       = last.get("Quorex (int8 + Piste1 + Piste2)")
+    qopt    = last.get("Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16)")
+    hnsw    = last.get("hnswlib (C++ float32)")
+    faiss_f = last.get("FAISS IndexHNSWFlat (Meta, C++)")
 
-    if quorex and hnswlib_e:
-        print(f"\n  Quorex vs hnswlib (même algo, Python vs C++) :")
-        print(f"    Recall  : Quorex {quorex.recall_at_10:.2%} vs hnswlib {hnswlib_e.recall_at_10:.2%}")
-        print(f"    RAM     : Quorex {quorex.ram_mb:.1f}MB vs hnswlib {hnswlib_e.ram_mb:.1f}MB")
-        print(f"    Latence : Quorex {quorex.p50_ms:.3f}ms vs hnswlib {hnswlib_e.p50_ms:.3f}ms (C++ avantage attendu)")
+    if q and qopt:
+        gain = qopt.recall_at_10 - q.recall_at_10
+        lat  = qopt.p50_ms / q.p50_ms
+        print(f"\n  Quorex vs Quorex-Optimized :")
+        print(f"    Recall  : {q.recall_at_10:.2%} → {qopt.recall_at_10:.2%} ({gain:+.2%})")
+        print(f"    Latence : {q.p50_ms:.3f}ms → {qopt.p50_ms:.3f}ms ({lat:.2f}x)")
+        print(f"    RAM     : {q.ram_mb:.1f}MB → {qopt.ram_mb:.1f}MB")
 
-    if quorex and faiss_flat:
-        print(f"\n  Quorex vs FAISS HNSWFlat (référence académique) :")
-        print(f"    Recall  : Quorex {quorex.recall_at_10:.2%} vs FAISS {faiss_flat.recall_at_10:.2%}")
-        print(f"    RAM     : Quorex {quorex.ram_mb:.1f}MB vs FAISS {faiss_flat.ram_mb:.1f}MB")
+    if qopt and hnsw:
+        print(f"\n  Quorex-Optimized vs hnswlib C++ :")
+        print(f"    Recall  : {qopt.recall_at_10:.2%} vs {hnsw.recall_at_10:.2%}")
+        print(f"    RAM     : {qopt.ram_mb:.1f}MB vs {hnsw.ram_mb:.1f}MB")
+        print(f"    Latence : {qopt.p50_ms:.3f}ms vs {hnsw.p50_ms:.3f}ms (C++ avantage attendu)")
+
+    if qopt and faiss_f:
+        print(f"\n  Quorex-Optimized vs FAISS HNSWFlat :")
+        print(f"    Recall  : {qopt.recall_at_10:.2%} vs {faiss_f.recall_at_10:.2%}")
+        print(f"    RAM     : {qopt.ram_mb:.1f}MB vs {faiss_f.ram_mb:.1f}MB")
 
 # ── Export CSV ────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,25 @@
+engine,implementation,n_vectors,ram_mb,p50_ms,p95_ms,p99_ms,recall_at_10,throughput_rps
+Quorex-Baseline (HNSW float32),Python,10000,12.11,1.3328,1.9225,2.2311,0.994,752.95
+Quorex-Baseline (HNSW float32),Python,21544,25.79,1.181,1.8749,2.3579,0.9745,831.3
+Quorex-Baseline (HNSW float32),Python,46415,56.6,1.3543,2.0158,2.7976,0.937,665.91
+Quorex-Baseline (HNSW float32),Python,100000,121.25,1.6873,2.8047,3.6452,0.909,543.86
+Quorex (int8 + Piste1 + Piste2),Python,10000,10.48,2.0982,3.0107,3.6503,0.971,465.66
+Quorex (int8 + Piste1 + Piste2),Python,21544,22.27,2.5088,3.664,4.4394,0.947,397.51
+Quorex (int8 + Piste1 + Piste2),Python,46415,48.99,2.6147,3.7839,4.7906,0.903,351.9
+Quorex (int8 + Piste1 + Piste2),Python,100000,104.99,3.197,5.2933,7.2649,0.876,282.47
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,10000,10.63,3.079,4.2775,5.1114,0.974,324.26
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,21544,22.6,3.9422,5.7054,6.3225,0.9515,253.89
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,46415,49.7,3.8101,5.6797,7.0349,0.9165,251.6
+Quorex-Optimized (int8 + Piste1+2 + ef=80 + R=16),Python,100000,106.8,4.8168,7.3594,8.2371,0.9025,199.75
+hnswlib (C++ float32),C++,10000,0.45,0.0262,0.038,0.0478,0.999,36005.94
+hnswlib (C++ float32),C++,21544,0.98,0.0515,0.1139,0.1615,0.9985,12368.77
+hnswlib (C++ float32),C++,46415,2.12,0.0617,0.1153,0.133,0.9975,14953.94
+hnswlib (C++ float32),C++,100000,4.57,0.0866,0.134,0.1574,0.993,11267.67
+"FAISS IndexHNSWFlat (Meta, C++)",C++,10000,3.82,0.0407,0.0585,0.0719,0.9985,23133.85
+"FAISS IndexHNSWFlat (Meta, C++)",C++,21544,8.22,0.0598,0.084,0.0956,0.9975,16065.36
+"FAISS IndexHNSWFlat (Meta, C++)",C++,46415,17.71,0.0932,0.1328,0.2133,0.998,8592.14
+"FAISS IndexHNSWFlat (Meta, C++)",C++,100000,38.15,0.1335,0.1778,0.2619,0.99,4910.07
+"FAISS IVF+SQ8 (Meta, C++)",C++,10000,7.63,0.0781,0.1106,0.2408,0.9155,8848.7
+"FAISS IVF+SQ8 (Meta, C++)",C++,21544,16.44,0.128,0.1863,0.2756,0.92,6412.16
+"FAISS IVF+SQ8 (Meta, C++)",C++,46415,35.41,0.2183,0.342,0.4111,0.94,3772.91
+"FAISS IVF+SQ8 (Meta, C++)",C++,100000,57.22,0.505,0.8278,0.973,0.914,1579.78

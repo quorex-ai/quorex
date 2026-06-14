@@ -71,6 +71,9 @@ class RetrieveRequest(BaseModel):
     query     : str
     top_k     : int | None = None
     threshold : float | None = None
+    # Optional reference time for decay. When the caller "freezes" a user,
+    # it pins `now` so temporal decay stops advancing. Defaults to current time.
+    now       : float | None = None
 
 class ForgetRequest(BaseModel):
     user_id : str
@@ -110,6 +113,7 @@ def retrieve(req: RetrieveRequest):
             req.query,
             top_k=req.top_k,
             threshold=req.threshold,
+            now=req.now,
         )
         return {
             "memories": [
@@ -163,5 +167,34 @@ def purge(req: PurgeRequest):
 def stats(user_id: str | None = None):
     try:
         return manager.stats(user_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory/export", dependencies=[Depends(verify_key)])
+def export(user_id: str):
+    """
+    Returns ALL live memories for a user (GDPR data portability).
+
+    Read-only: enumerates the segment metadata directly without touching the
+    MemoryManager / scorer / index. Soft-deleted vectors are already removed
+    from `_metadata`, so only live memories are returned.
+    """
+    try:
+        seg = manager.engine.segment
+        user_meta = seg._metadata.get(user_id, {})
+        memories = []
+        for vec_id, meta in user_meta.items():
+            inner = meta.get("metadata", {}) or {}
+            memories.append({
+                "vec_id":         vec_id,
+                "action":         meta.get("action", ""),
+                "text":           inner.get("text", meta.get("action", "")),
+                "timestamp":      inner.get("timestamp"),
+                "reinforcements": inner.get("reinforcements", 1),
+                "meta":           meta,
+            })
+        memories.sort(key=lambda m: (m["timestamp"] or 0))
+        return {"user_id": user_id, "count": len(memories), "memories": memories}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

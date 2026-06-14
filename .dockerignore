@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+.venv
+venv
+benchmarks
+results
+tests
+*.egg-info
+.DS_Store

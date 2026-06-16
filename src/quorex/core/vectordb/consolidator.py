@@ -16,11 +16,12 @@ Consolidation cycle (triggered every N inserts or on demand):
                 into a single semantic node (centroid)
   6. Apply    — push new bio_weights to HNSWIndex via apply_bio_weights()
 
-No graph restructuring during consolidation — only bio_weight updates.
-Graph topology stays coherent. Recall@k preserved.
-
-Merge creates a new "semantic" node and deletes the originals — this
-triggers a partial graph rebuild (segment.compact) for the affected user.
+Key change vs previous version:
+  - Decay and freq_boost are now fully independent (no shared log term)
+  - Scores are normalized relative to the best node in each user index
+    so the cap at 1.0 never flattens the signal between nodes
+  - freq_boost is linear (not log) on reinforcements so that a node
+    with reinforcements=3 clearly outweighs reinforcements=1
 """
 
 from __future__ import annotations
@@ -34,11 +35,27 @@ import numpy as np
 
 @dataclass
 class ConsolidationConfig:
-    decay_stability_factor: float = 0.8
-    freq_boost_factor: float = 0.3
+    # Decay — how fast memories fade with time.
+    # Higher = slower decay (more stable memories).
+    # decay = exp(-hours_ago / (24 * decay_stability_factor))
+    decay_stability_factor: float = 2.0
+
+    # Freq boost — how much reinforcement count amplifies the score.
+    # freq_boost = 1.0 + freq_boost_factor * reinforcements
+    # Linear (not log) so that r=3 clearly beats r=1.
+    freq_boost_factor: float = 0.5
+
+    # Conflict penalty — how much conflict degrades the score.
     conflict_penalty_factor: float = 0.4
-    prune_threshold: float = 0.001   # ← was 0.05, beaucoup plus conservateur
+
+    # Prune threshold — relative weight below which a node is pruned.
+    # 0.05 means a node faded to 5% of the best node's score is removed.
+    prune_threshold: float = 0.05
+
+    # Merge threshold — cosine similarity above which two episodic nodes
+    # are fused into a single semantic node.
     merge_threshold: float = 0.96
+
     max_merges_per_cycle: int = 50
     consolidate_every: int = 500
 
@@ -47,32 +64,32 @@ class Consolidator:
     """
     Stateless consolidation engine — operates on Segment + HNSWIndex objects.
     Called by VectorDBEngine._mark_write() when the write counter hits
-    consolidate_every, or manually via engine.consolidate().
+    consolidate_every, or manually via engine.consolidator.run(segment).
     """
 
     def __init__(self, config: ConsolidationConfig | None = None):
         self.config = config or ConsolidationConfig()
         self._cycle_count = 0
 
-    # ── Main entry point ─────────────────────────────────────────────────
+    # ── Main entry point ──────────────────────────────────────────────
 
     def run(self, segment, engine_lock=None) -> dict:
         """
         Full consolidation cycle across all users in the segment.
 
         Returns a stats dict:
-          { users, weights_updated, pruned, merged, duration_ms }
+          { cycle, users, weights_updated, pruned, merged, duration_ms }
         """
         t0 = time.perf_counter()
         self._cycle_count += 1
 
         stats = {
-            "cycle": self._cycle_count,
-            "users": 0,
+            "cycle":           self._cycle_count,
+            "users":           0,
             "weights_updated": 0,
-            "pruned": 0,
-            "merged": 0,
-            "duration_ms": 0.0,
+            "pruned":          0,
+            "merged":          0,
+            "duration_ms":     0.0,
         }
 
         now = time.time()
@@ -84,7 +101,7 @@ class Consolidator:
 
             stats["users"] += 1
 
-            # Step 1 — Compute new bio_weights
+            # Step 1 — Compute new bio_weights (normalized per user)
             new_weights, to_prune = self._compute_weights(idx, now)
             stats["weights_updated"] += len(new_weights)
 
@@ -103,52 +120,73 @@ class Consolidator:
         stats["duration_ms"] = (time.perf_counter() - t0) * 1000
         return stats
 
-    # ── Weight computation ────────────────────────────────────────────────
+    # ── Weight computation ────────────────────────────────────────────
 
     def _compute_weights(
         self, idx, now: float
     ) -> tuple[dict[int, float], list[int]]:
         """
-        Computes bio_weight for every node.
-        Returns (weights_dict, prune_list).
+        Computes bio_weight for every node in one user's index.
+
+        Key design decisions:
+        1. Decay and freq_boost are fully independent — decay depends only
+           on time, freq_boost depends only on reinforcements.
+        2. Scores are normalized by the best node's raw score so that
+           the cap at 1.0 never flattens differences between nodes.
+        3. freq_boost is linear (not log) so r=3 clearly beats r=1.
+
+        Formula:
+            raw = exp(-hours / (24 * stability)) * (1 + factor * r) * conflict
+            w   = raw / max(raw_scores)   ← relative normalization
         """
         cfg = self.config
-        new_weights: dict[int, float] = {}
-        to_prune: list[int] = []
+        raw_scores: dict[int, float] = {}
 
         for vec_id, node in idx.nodes.items():
             hours_ago = (now - node.timestamp) / 3600.0
 
-            # Ebbinghaus forgetting curve with reinforcement-based stability
-            # S = 1 + factor * log(1 + reinforcements)
-            stability = 1.0 + cfg.decay_stability_factor * math.log1p(node.reinforcements)
-            decay = math.exp(-hours_ago / (24.0 * stability))
+            # Decay — purely time-based, stability is a fixed config param
+            decay = math.exp(
+                -hours_ago / (24.0 * cfg.decay_stability_factor)
+            )
 
-            # Frequency boost — diminishing returns via log
-            freq_boost = 1.0 + cfg.freq_boost_factor * math.log1p(node.reinforcements)
+            # Freq boost — linear on reinforcements (not log)
+            # r=1 → 1.5x, r=3 → 2.5x, r=10 → 6.0x
+            freq_boost = 1.0 + cfg.freq_boost_factor * node.reinforcements
 
             # Conflict penalty
-            conflict_penalty = 1.0 - cfg.conflict_penalty_factor * node.conflict_score
+            conflict_penalty = max(
+                0.0, 1.0 - cfg.conflict_penalty_factor * node.conflict_score
+            )
 
-            # Final bio_weight — clamped to [0, 1]
-            w = decay * freq_boost * conflict_penalty
-            w = max(0.0, min(1.0, w))
+            raw_scores[vec_id] = decay * freq_boost * conflict_penalty
 
-            new_weights[vec_id] = w
+        if not raw_scores:
+            return {}, []
 
-            if w < cfg.prune_threshold:
-                to_prune.append(vec_id)
+        # Normalize relative to the best node in this user's index
+        # This ensures the winner always gets bio_weight=1.0 and others
+        # are proportional — the cap at 1.0 never flattens the signal.
+        max_score = max(raw_scores.values())
+        if max_score > 0:
+            new_weights = {
+                vid: float(s / max_score)
+                for vid, s in raw_scores.items()
+            }
+        else:
+            new_weights = {vid: 0.0 for vid in raw_scores}
 
-        # Don't prune nodes that are in to_prune but have been reinforced
-        # recently (safety: keep nodes inserted in the last hour)
-        safe_prune = [
-            vid for vid in to_prune
-            if (now - idx.nodes[vid].timestamp) > 24 * 3600.0  # ← was 3600, now 24h
+        # Prune nodes below threshold AND older than 24h
+        # (safety: never prune very recent nodes even if score is low)
+        to_prune = [
+            vid for vid, w in new_weights.items()
+            if w < cfg.prune_threshold
+            and (now - idx.nodes[vid].timestamp) > 24 * 3600.0
         ]
 
-        return new_weights, safe_prune
+        return new_weights, to_prune
 
-    # ── Episodic merge ────────────────────────────────────────────────────
+    # ── Episodic merge ────────────────────────────────────────────────
 
     def _merge_episodic(
         self, segment, user_id: str, idx, now: float
@@ -185,7 +223,7 @@ class Consolidator:
             if vec_a is None:
                 continue
 
-            cluster = [vid_a]
+            cluster      = [vid_a]
             cluster_vecs = [vec_a]
 
             for vid_b, node_b in candidates[i + 1:]:
@@ -204,7 +242,9 @@ class Consolidator:
                 continue
 
             # Fuse — centroid vector, sum reinforcements
-            centroid = np.mean(np.stack(cluster_vecs), axis=0).astype(np.float32)
+            centroid = np.mean(
+                np.stack(cluster_vecs), axis=0
+            ).astype(np.float32)
             norm = float(np.linalg.norm(centroid))
             if norm > 0:
                 centroid /= norm
@@ -221,7 +261,10 @@ class Consolidator:
             )
 
             # Pick representative meta from the most recent node
-            best_vid = max(cluster, key=lambda v: idx.nodes[v].timestamp if v in idx.nodes else 0)
+            best_vid = max(
+                cluster,
+                key=lambda v: idx.nodes[v].timestamp if v in idx.nodes else 0
+            )
             best_meta = segment._metadata.get(user_id, {}).get(best_vid, {})
 
             # Delete episodic originals
@@ -234,10 +277,10 @@ class Consolidator:
                 **best_meta,
                 "metadata": {
                     **(best_meta.get("metadata") or {}),
-                    "timestamp": latest_ts,
+                    "timestamp":    latest_ts,
                     "reinforcements": total_reinforcements,
-                    "semantic": True,
-                    "merged_from": cluster,
+                    "semantic":     True,
+                    "merged_from":  cluster,
                 }
             }
             new_id = segment.insert(user_id, centroid, new_meta)
@@ -247,9 +290,9 @@ class Consolidator:
             if new_idx:
                 new_node = new_idx.nodes.get(new_id)
                 if new_node:
-                    new_node.timestamp = latest_ts
+                    new_node.timestamp      = latest_ts
                     new_node.reinforcements = total_reinforcements
-                    new_node.bio_weight = 1.0  # semantic nodes start fresh
+                    new_node.bio_weight     = 1.0  # semantic nodes start fresh
 
             merged_count += 1
 
@@ -259,7 +302,7 @@ class Consolidator:
         if node.vector is not None:
             return node.vector
         if node.quantized is not None and idx.quantizer is not None:
-            v = idx.quantizer.decode(node.quantized)
+            v    = idx.quantizer.decode(node.quantized)
             norm = float(np.linalg.norm(v))
             return v / norm if norm > 0 else v
         return None
@@ -269,7 +312,8 @@ class Consolidator:
         return (
             f"Consolidator("
             f"cycle={self._cycle_count}, "
+            f"decay_stability={cfg.decay_stability_factor}, "
+            f"freq_boost={cfg.freq_boost_factor}, "
             f"prune_threshold={cfg.prune_threshold}, "
-            f"merge_threshold={cfg.merge_threshold}, "
             f"every={cfg.consolidate_every})"
         )

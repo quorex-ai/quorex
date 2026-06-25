@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import numpy as np
 from .segment import Segment
 from .wal import WAL, OpType
@@ -62,6 +63,15 @@ class VectorDBEngine:
             print("Snapshot loaded.")
         except FileNotFoundError:
             print("No snapshot found — starting fresh.")
+        except Exception as e:
+            # A corrupt or dimension-incompatible snapshot must never take the
+            # whole engine down. Quarantine the bad files (the WAL belongs to the
+            # same era) and start from an empty, healthy store instead of crashing.
+            print(f"WARNING: snapshot load failed ({e!r}); quarantining and starting fresh.")
+            self._quarantine_corrupt_state()
+            self.wal.open()
+            print(f"VectorDBEngine started (fresh after corrupt snapshot) → {self.path}/")
+            return
 
         entries = self.wal.replay()
         cp = self.wal.last_checkpoint()
@@ -89,6 +99,27 @@ class VectorDBEngine:
 
         self.wal.open()
         print(f"VectorDBEngine started → {self.path}/")
+
+    def _quarantine_corrupt_state(self) -> None:
+        """
+        Move an unreadable snapshot + WAL aside (renamed *.corrupt-<ts>) and
+        drop any partial in-memory state, so the engine can boot on an empty,
+        healthy store instead of crash-looping on the same bad files.
+        """
+        stamp = int(time.time())
+        for p in (self.storage.path, self.wal.path):
+            try:
+                if os.path.exists(p):
+                    os.rename(p, f"{p}.corrupt-{stamp}")
+                    print(f"  quarantined {p} → {p}.corrupt-{stamp}")
+            except OSError as err:
+                print(f"  WARNING: could not quarantine {p}: {err}")
+        # Clear anything a partial load may have populated.
+        for d in (self.segment._indexes, self.segment._metadata,
+                  self.segment._counters, self.segment._pending_deletes):
+            d.clear()
+        self.quantizer = None
+        self.segment.quantizer = None
 
     def stop(self) -> None:
         with self._lock:

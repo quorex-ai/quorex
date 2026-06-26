@@ -21,9 +21,10 @@ import os
 from dataclasses import dataclass, field
 
 from ..vectordb.engine import VectorDBEngine
-from ..embeddings.encoder import Encoder
+from ..embeddings.hashing import HashingEncoder
 from .scorer import MemoryScorer, MemoryScore, ScorerConfig
 from .decay import DecayConfig, DECAY_HUMAN
+from .conflict import ConflictResolver, ConflictConfig
 
 
 @dataclass
@@ -42,12 +43,14 @@ class MemoryConfig:
     """
     db_path          : str         = "/tmp/quorex_memory"
     encoder_path     : str         = "/tmp/quorex_encoder"
-    n_components     : int         = 32
+    n_components     : int         = 256
     scorer           : ScorerConfig = field(default_factory=ScorerConfig)
     top_k            : int         = 5
     threshold        : float       = 0.05
     reinforce        : bool        = True
     checkpoint_every : int         = 50
+    resolve_conflicts: bool        = True
+    conflict         : ConflictConfig = field(default_factory=ConflictConfig)
 
 
 @dataclass
@@ -115,13 +118,17 @@ class MemoryManager:
 
     def __init__(self, config: MemoryConfig | None = None):
         self.config  = config or MemoryConfig()
-        self.encoder = Encoder(n_components=self.config.n_components)
+        self.encoder = HashingEncoder(dim=self.config.n_components)
         self.engine  = VectorDBEngine(
             path=self.config.db_path,
             dim=self.config.n_components,
             checkpoint_every=self.config.checkpoint_every,
         )
         self.scorer  = MemoryScorer(self.config.scorer)
+        self.conflict = (
+            ConflictResolver(self.config.conflict)
+            if self.config.resolve_conflicts else None
+        )
         self._started = False
 
     # ------------------------------------------------------------------
@@ -193,11 +200,27 @@ class MemoryManager:
             meta["metadata"] = {}
         meta["metadata"]["timestamp"]      = timestamp
         meta["metadata"]["reinforcements"] = 1
+        # Mark active — used by conflict resolution + the recall filter.
+        meta["metadata"]["__status__"]     = "active"
 
         # Encode
         vector = self.encoder.encode(event)
 
-        # Store
+        # Conflict resolution (the core of Quorex):
+        #   - identical fact      → reinforce the existing memory (no duplicate)
+        #   - contradictory fact  → archive the stale memory, store the new one
+        #   - unrelated fact      → just store it
+        if self.conflict is not None:
+            result = self.conflict.check_and_resolve(
+                self.engine, self.encoder, user_id, vector, meta,
+            )
+            if result.is_reinforcement:
+                print(f"[conflict] {result.message}")
+                return result.reinforced_vec_id
+            if result.is_conflict:
+                print(f"[conflict] {result.message}")
+
+        # Store (NONE → new memory; CONFLICT → new active memory, old archived)
         vec_id = self.engine.insert(user_id, vector, meta)
         return vec_id
 
@@ -245,6 +268,12 @@ class MemoryManager:
         for r in raw_results:
             meta = r.get("meta", {})
             inner_meta = meta.get("metadata", {})
+            # Suppress archived (conflict-resolved) and soft-deleted memories so a
+            # fact that has been contradicted never resurfaces.
+            if inner_meta.get("__status__", "active") != "active":
+                continue
+            if meta.get("__deleted__", False):
+                continue
             scorer_input.append({
                 "id":    r["id"],
                 "score": r["score"],

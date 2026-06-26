@@ -91,8 +91,8 @@ class ConflictConfig:
                               into semantic slots for conflict detection.
                               Default: "category"
     """
-    reinforcement_threshold : float = 0.92
-    conflict_threshold      : float = 0.65
+    reinforcement_threshold : float = 0.95
+    conflict_threshold      : float = 0.45
     max_archived_per_slot   : int   = 3
     category_field          : str   = "category"
 

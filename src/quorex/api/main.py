@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     config = MemoryConfig(
         db_path      = os.getenv("QUOREX_DB_PATH",      "/data/quorex_memory"),
         encoder_path = os.getenv("QUOREX_ENCODER_PATH", "/data/quorex_encoder"),
-        n_components = int(os.getenv("QUOREX_DIMS", "32")),
+        n_components = int(os.getenv("QUOREX_DIMS", "256")),
         top_k        = 5,
         threshold    = 0.05,
     )

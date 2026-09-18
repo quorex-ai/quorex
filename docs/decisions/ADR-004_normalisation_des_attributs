@@ -1,0 +1,33 @@
+# ADR-004 : Normalisation des attributs et table de synonymes
+
+Statut : acceptée, septembre 2026
+Décideurs : Clément, Samy
+
+## Contexte : 
+
+Le niveau (a) de la contradiction repose sur une correspondance exacte de l'attribut. Sans normalisation, "Couleur préférée", "couleur preferee" et "couleur favorite" sont trois attributs distincts et le niveau (a) ne se déclenche jamais, ce qui renvoie tout vers l'embedding et le LLM.
+
+## Décision
+
+`normalize(attribute_raw)` est une fonction pure, appliquée à toute entrée avant tout rapprochement : 
+
+1. Minuscules.
+2. Décomposition NFKD et suppression des diacritiques.
+3. Espaces, tirets et apostrophes remplacés par `_` ; caractères non alphanumériques supprimés ; `_` consécutifs fusionnées, `_` en bord retirés.
+4. Lookup dans la table `synonyms` : si le résultat est une variante connue, remplacement par sa forme canonique.
+
+La table `synonyms` est alimentée par `synonyms.yaml`, versionné dans le dépôt, chargé à la migration. La première liste couvre une treintaine d'attributs courants (identité, préférences, localisation, travail, relations) avec leurs variantes en français et anglais. Elle est écrite et relue.
+
+L'attribut brut est conservé dans `attribute_raw` pour le débogage et pour enrichir la table de synonymes à partir de cas réels.
+
+## Alternatives écartées
+
+- Embedding seul : non déterministe, coûteux, et rate les cas les plus fréquent qu'une table résout gratuitement.
+- Lemmatisation ou stremming : ajoute une dépendance lourde pour un gain faible sur des attributs courts.
+- Synonymes appris automatiquement : plus tard, à partit des `attribute_raw` accumulés.
+
+## Conséquences
+
+- `normalize` est testée exhaustivement (table de cas entrée/sortie).
+- La liste de synonymes est une donnée du produit, pas du code : elle évolue par PR et se mesure sur le taux de résolution au niveau (a).
+- Deux tenants partagent la même table en v1. Une table par tenant viendra si un client a un vocabulaire métier propre.

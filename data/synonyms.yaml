@@ -1,0 +1,290 @@
+# Table de synonymes d'attributs (ADR-004)
+#
+# Clé : forme canonique, déjà normalisée (minuscule, sans accents, snake_case)
+# Valeurs : variantes telles qu'elles sortent de normalize() AVANT le lookup.
+# La forme canonique elle-même n'a pas besoin d'être listée comme variante.
+# 
+# Règles : 
+# - Une variante appartient à un seul canonique. Le chargeur refuse les doublons.
+# - Français et anglais mélangés : le produit reçoit les deux.
+# - On n'ajoute une variante que si on l'a vue ou qu'on est sûr de la voir.
+#   Ce fichier est mesuré (taux de résolution au niveau a), pas décoré.
+# - Toute ligne ajoutée après un cas réel cite l'attribute_raw d'origine en commentaire.
+
+# --- Identité ---
+ 
+prenom:
+  - prenom_utilisateur
+  - first_name
+  - firstname
+  - given_name
+  - name # ambi, tranché vers prénom : les agents demandent d'abord le prénom
+
+nom:
+  - nom_de_famille
+  - patronyme
+  - last_name
+  - lastname
+  - surname
+  - family_name
+
+age:
+  - l_age
+  - nom_age
+  - age_utilisateur
+  - years_old
+
+date_de_naissance:
+  - date_naissance
+  - ne_le
+  - nee_le
+  - anniversaire
+  - birth_date
+  - birthday
+  - date_of_birth
+  - dob
+
+ville_de_naissance:
+  - ne_a
+  - nee_a
+  - lieu_de_naissance
+  - brithplace
+  - place_of_birth
+  - born_in
+
+langue:
+  -  langue_parlee
+  - langue_preferee
+  - langue_maternelle
+  - language
+  - preferred_language
+  - native_language
+  - mother_tongue
+
+# --- Localisation ---
+
+ville_de_residence:
+  - ville_residence
+  - ville
+  - habite_a
+  - lieu_de_residence
+  - domicile
+  - city
+  - home_city
+  - lives_in
+  - residence
+
+pays: 
+  - pays_de_residence
+  - contry
+  - home_country
+
+adresse:
+  - adresse_postale
+  - domicile_adresse
+  - adress
+  - home_address
+
+fuseau_horaire:
+  - timezone
+  - time_zone
+  - fuseau
+
+localisation_actuelle:
+  - position_actuelle
+  - se_trouve_a
+  - actuellement_a
+  - en_deplacement_a
+  - current_location
+  - currently_in
+  - location
+
+# --- Travail ---
+
+employer:
+  - entreprise
+  - societe
+  - boite
+  - travaille_chez
+  - bosse_chez
+  - company
+  - employer
+  - works_at
+
+poste:
+  - metier
+  - profession
+  - fonction
+  - initule_de_poste
+  - job
+  - job_title
+  - role
+  - occupation
+  - position # ambigu avec la localisation ;  tranché vers poste, à mésurer
+
+manager:
+  - responsable
+  - chef
+  - superieur
+  - n_plus_1
+  - n1
+  - boss
+  - supervisor
+  - line_manager
+
+equipe:
+  - team
+  - service
+  - departement
+  - department
+
+date_de_debut_employeur:
+  - date_debut_employeur
+  - anciennete
+  - depuis_chez_employeur
+  - start_date
+  - joined_at
+
+# --- Relations ---
+
+conjoint:
+  - femme
+  - mari
+  - epouse
+  - epoux
+  - compagne
+  - compagnon
+  - partenaire
+  - copine
+  - copain
+  - partner
+  - spouse
+  - wife
+  - husband
+  - girlfriend
+  - boyfriend
+
+enfants:
+  - enfant
+  - nom_d_enfant
+  - fils
+  - fille
+  - children
+  - kids
+  - child
+
+# --- Préférences ---
+
+couleur_preferee:
+  - couleur_favorite
+  - couleur_prefere
+  - couleur_pref
+  - ma_couleur
+  - favorite_color
+  - favourite_color
+  - preferred_color
+  - color_preference
+
+plat_preferee:
+  - plat_favori
+  - nourriture_preferee
+  - cuisine_preferee
+  - favorite_food
+  - favourite_food
+  - favorite_dish
+
+boisson_preferee:
+  - boisson_favorite
+  - favorite_drink
+  - favourite_drink
+
+musique_preferee:
+  - genre_musical
+  - style_musical
+  - artiste_prefere
+  - favorite_artist
+  - music_tastee
+  - favorite_music
+
+sport:
+  - sport_pratique
+  - activite_physique
+  - sports
+  - favorite_sport
+
+loisirs:
+  - hobby
+  - hobbies
+  - passe_temps
+  - centre_d_interet
+  - interests
+  - interet
+  - passions
+
+regime_alimentaire:
+  - regime
+  - alimentation
+  - vegetarien
+  - vegan
+  - diet
+  - dietary_preference
+  - eating_habits
+
+# --- Communication ---
+
+ton_prefere:
+  - style_de_communication
+  - tutoiement
+  - vouvoiement
+  - formalite
+  - tone
+  - communication_style
+  - preferred_tone
+  - formality
+
+canal_prefere:
+  - moyen_de_contact
+  - mail
+  - courriel
+  - e_mail
+  - email_adress
+
+telephone:
+  - numero
+  - numero_de_telephone
+  - portable
+  - phone
+  - phone_number
+  - mobile
+
+# --- Objectif et contexte ---
+
+objectif:
+  - but
+  - objectif_principal
+  - cherche_a 
+  - goal
+  - main_goal
+  - objective
+
+budget:
+  - budget_max
+  - budget_maximum
+  - enveloppe
+  - max_budget
+  - price_range
+
+# --- NE PAS fusionner (documentation, pas de synonyme) ---
+#
+# Ces paires ressemblent à des synonymes et ne le sont pas. Elles sotn ici pour
+# que les personne ne les ajoute par erreur, et elles vont dans attribute_pairs.yaml.csv
+# avec l'étiquette "different"
+#
+#   couleur_preferee        vs  couleur_voiture
+#   ville_de_residence      vs  localisation_actuelle
+#   ville_de_residence      vs  ville_de_naissance
+#   ville_de_residence      vs  ville_de_residence_future
+#   employeur               vs  employeur_precedent
+#   manager                 vs  conjoint
+#   langue                  vs  langue_de_travail
+#   age                     vs  date_de_naissance   (dérivable, mais deux faits distincts)

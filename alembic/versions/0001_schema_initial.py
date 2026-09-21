@@ -99,18 +99,18 @@ CREATE INDEX synonyms_canonical_idx ON synonyms(canonical);
 
 def _load_synonyms() -> list[dict[str, str]]:
     path = Path(__file__).resolve().parents[2] / "data" / "synonyms.yaml"
-    data = yaml.safe_load(path.read_text(encodings="utf-8")) or {}
-    rows = list[dict[str, str]] = []
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    rows: list[dict[str, str]] = []
     seen: dict[str, str] = {}
     for canonical, variants in data.items():
         for variant in variants or []:
             if variant in seen and seen[variant] != canonical:
                 raise ValueError(
-                    f"Synonyms.yaml : '{variant}' mappé vers '{seen[variant]}' et '{canonical}'"
+                    f"synonyms.yaml : '{variant}' mappé vers '{seen[variant]}' et '{canonical}'"
                 )
             seen[variant] = canonical
             rows.append({"variant": variant, "canonical": canonical})
-            return rows
+    return rows
 
 def upgrade() -> None:
     op.execute(SCHEMA)

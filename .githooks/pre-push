@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuse tout push direct vers main. Voir CONTRIBUTING.md.
+while read local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    echo "Push direct sur main refusé. Merge dev dans main via une PR validée à deux."
+    exit 1
+  fi
+done
+exit 0

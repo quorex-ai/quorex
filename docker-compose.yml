@@ -1,0 +1,20 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: quorex-db
+    environment:
+      POSTGRES_USER: quorex
+      POSTGRES_PASSWORD: quorex
+      POSTGRES_DB: quorex
+    ports:
+      - "5432:5432"
+    volumes:
+      - quorex-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quorex -d quorex"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  quorex-pgdata:

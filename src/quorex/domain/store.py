@@ -1,9 +1,3 @@
-"""Interface FactStore (ADR-001, architecture.md 6.2).
-
-Seule storage/ l'implémente. Aucun appelant ne connaît SQL.
-Toute méthode reçoit implicitement le tenant via les identifiants qu'on lui passe :
-une implémentation DOIT filtrer sur tenant_id dans chaque requête.
-"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -14,7 +8,15 @@ from quorex.domain.models import Diff, EndReason, Fact, NewFact
 
 
 class ConcurrentWrite(Exception):
-    """Levée quand un replace/create perd deux fois de suite face à une écriture concurrente."""
+    """Un replace/create a perdu deux fois de suite face à une écriture concurrente."""
+
+
+class ActiveFactExists(Exception):
+    """create() a rencontré un fait actif sur (user, subject, attribute). Passer par replace()."""
+
+    def __init__(self, existing: Fact) -> None:
+        super().__init__(f"fait actif existant : {existing.subject}.{existing.attribute}")
+        self.existing = existing
 
 
 class FactStore(Protocol):
@@ -39,7 +41,9 @@ class FactStore(Protocol):
 
     def diff(self, tenant_id: UUID, user_id: UUID, from_: datetime, to: datetime) -> Diff: ...
 
-    def create(self, fact: NewFact) -> Fact: ...
+    def create(self, fact: NewFact) -> Fact:
+        """Crée un fait actif. Lève ActiveFactExists si l'index unique refuse."""
+        ...
 
     def replace(self, old_id: UUID, new: NewFact, reason: EndReason = EndReason.REPLACED) -> tuple[Fact, Fact]:
         """Atomique : clôt old_id, crée new, lie replaced_by. Retourne (ancien clos, nouveau)."""

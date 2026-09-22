@@ -41,7 +41,7 @@ Vérifier : `curl http://localhost:8000/health` doit répondre `{"status":"ok"}`
 Créer un tenant et une clé :
 
 ```bash
-uv run quorex tenant create --name demo
+uv run quorex tenant create demo
 # affiche l'id du tenant et une clé qx_... à copier maintenant, elle n'est jamais réaffichée
 ```
 

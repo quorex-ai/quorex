@@ -19,8 +19,18 @@ class ActiveFactExists(Exception):
         self.existing = existing
 
 
+class StaleFact(Exception):
+    """replace() : le fait à clore n'est plus actif (quelqu'un l'a clos entre-temps)."""
+
+    def __init__(self, fact_id: UUID) -> None:
+        super().__init__(f"fait {fact_id} déjà clos")
+        self.fact_id = fact_id
+
+
 class FactStore(Protocol):
     def get_active(self, tenant_id: UUID, user_id: UUID, subject: str, attribute: str) -> Fact | None: ...
+
+    def get_by_id(self, tenant_id: UUID, fact_id: UUID) -> Fact | None: ...
 
     def list_active(
         self, tenant_id: UUID, user_id: UUID, attributes: list[str] | None = None, now: datetime | None = None
@@ -45,8 +55,10 @@ class FactStore(Protocol):
         """Crée un fait actif. Lève ActiveFactExists si l'index unique refuse."""
         ...
 
-    def replace(self, old_id: UUID, new: NewFact, reason: EndReason = EndReason.REPLACED) -> tuple[Fact, Fact]:
-        """Atomique : clôt old_id, crée new, lie replaced_by. Retourne (ancien clos, nouveau)."""
+    def replace(self, old_id: UUID, new: NewFact) -> tuple[Fact, Fact]:
+        """Atomique : clôt old_id (replaced), crée new, lie replaced_by.
+        Lève StaleFact si old_id n'est plus actif, ActiveFactExists si un autre fait
+        actif occupe déjà (user, subject, attribute) du nouveau."""
         ...
 
     def close(self, tenant_id: UUID, fact_id: UUID, reason: EndReason, at: datetime | None = None) -> Fact: ...

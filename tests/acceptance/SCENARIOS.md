@@ -40,7 +40,7 @@ Actions :
 - Aucun `replaced_by`.
 - À J8, `recall()` ne renvoie plus `localisation_actuelle` (expiré) mais toujours `ville_residence`.
 
-Variante S2b : le fake LLM renvoie pour le second message le même attribut `ville_residence` mais `durability = transient`. Attendu : le fait durable n'est pas remplacé, le transitoire est créé à côté avec un avertissement dans la réponse, et à J8 il a disparu du recall.
+Variante S2b : le transitoire est ignoré avec l'avertissement transient_ignored_durable_exists, le durable reste seul actif
 
 ---
 

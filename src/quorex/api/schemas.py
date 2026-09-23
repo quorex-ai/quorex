@@ -1,4 +1,3 @@
-"""Schémas d'entrée/sortie de l'API v1."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -31,6 +30,7 @@ class FactOut(BaseModel):
     id: UUID
     subject: str
     attribute: str
+    attribute_raw: str
     value: str
     confidence: float
     durability: Durability
@@ -45,18 +45,19 @@ class FactOut(BaseModel):
     @classmethod
     def from_fact(cls, f: Fact) -> "FactOut":
         return cls(
-            id=f.id, subject=f.subject, attribute=f.attribute, value=f.value,
-            confidence=f.confidence, durability=f.durability, valid_from=f.valid_from,
-            valid_to=f.valid_to, recorded_at=f.recorded_at, expires_at=f.expires_at,
-            source_message_id=f.source_message_id, replaced_by=f.replaced_by,
-            end_reason=f.end_reason.value if f.end_reason else None,
+            id=f.id, subject=f.subject, attribute=f.attribute, attribute_raw=f.attribute_raw,
+            value=f.value, confidence=f.confidence, durability=f.durability,
+            valid_from=f.valid_from, valid_to=f.valid_to, recorded_at=f.recorded_at,
+            expires_at=f.expires_at, source_message_id=f.source_message_id,
+            replaced_by=f.replaced_by, end_reason=f.end_reason.value if f.end_reason else None,
         )
 
 
 class RememberResult(BaseModel):
-    fact: FactOut
-    action: Literal["created", "replaced"]
+    action: Literal["created", "replaced", "ignored"]
+    fact: FactOut | None = None
     replaced_fact_id: UUID | None = None
+    level: str | None = None
 
 
 class RememberResponse(BaseModel):

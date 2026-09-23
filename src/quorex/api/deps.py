@@ -7,23 +7,39 @@ from fastapi import Depends, Header, Request
 
 from quorex.api.errors import InvalidApiKey
 from quorex.auth import extract_prefix, verify_api_key
+from quorex.contradiction import Resolver
+from quorex.normalization import Normalizer
 from quorex.storage import PostgresFactStore, PostgresTenantStore
+
 
 def get_fact_store(request: Request) -> PostgresFactStore:
     return request.app.state.facts
 
+
 def get_tenant_store(request: Request) -> PostgresTenantStore:
     return request.app.state.tenants
+
+
+def get_normalizer(request: Request) -> Normalizer:
+    return request.app.state.normalizer
+
+
+def get_resolver(request: Request) -> Resolver:
+    return request.app.state.resolver
+
 
 @dataclass(frozen=True, slots=True)
 class AuthContext:
     tenant_id: UUID
     api_key_id: UUID
 
-def get_auth(authorization: str | None = Header(default=None), tenants: PostgresTenantStore = Depends(get_tenant_store)) -> AuthContext:
+
+def get_auth(
+    authorization: str | None = Header(default=None),
+    tenants: PostgresTenantStore = Depends(get_tenant_store),
+) -> AuthContext:
     if not authorization or not authorization.startswith("Bearer "):
         raise InvalidApiKey("clé API absente")
-
     plain = authorization.removeprefix("Bearer ").strip()
     prefix = extract_prefix(plain)
     if prefix is None:
@@ -32,4 +48,3 @@ def get_auth(authorization: str | None = Header(default=None), tenants: Postgres
         if verify_api_key(plain, key.key_hash):
             return AuthContext(tenant_id=key.tenant_id, api_key_id=key.id)
     raise InvalidApiKey("clé API inconnue ou révoquée")
-    

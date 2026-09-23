@@ -9,11 +9,14 @@ from fastapi.responses import Response
 
 from quorex.api.errors import install_error_handlers
 from quorex.api.routes import router
+from quorex.contradiction import Resolver
 from quorex.ids import new_id
+from quorex.normalization import Normalizer
 from quorex.settings import Settings, get_settings
-from quorex.storage import Database, PostgresFactStore, PostgresTenantStore
+from quorex.storage import Database, PostgresFactStore, PostgresTenantStore, load_synonyms
 
 log = structlog.get_logger()
+
 
 def create_app(settings: Settings | None = None, db: Database | None = None) -> FastAPI:
     settings = settings or get_settings()
@@ -21,10 +24,14 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database = db or Database(settings.database_url)
+        facts = PostgresFactStore(database)
         app.state.db = database
-        app.state.facts = PostgresFactStore(database)
+        app.state.facts = facts
         app.state.tenants = PostgresTenantStore(database)
-        log.info("quorex.start", llm_provider=settings.llm_provider, embedding_model=settings.embedding_model)
+        app.state.normalizer = Normalizer(load_synonyms(database))
+        app.state.resolver = Resolver(facts)
+        log.info("quorex.start", llm_provider=settings.llm_provider,
+                 embedding_model=settings.embedding_model, synonyms=len(app.state.normalizer))
         yield
         if db is None:
             database.dispose()

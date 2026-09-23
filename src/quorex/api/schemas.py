@@ -1,10 +1,11 @@
+"""Schémas d'entrée/sortie de l'API v1."""
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from quorex.domain import Durability, Fact
 
@@ -68,11 +69,32 @@ class RememberResponse(BaseModel):
 class RecallRequest(BaseModel):
     user: str = Field(min_length=1, max_length=256)
     attributes: list[str] | None = None
+    as_of: datetime | None = None
     limit: int = Field(default=50, ge=1, le=500)
 
 
 class RecallResponse(BaseModel):
     facts: list[FactOut]
+    as_of: datetime | None = None
+
+
+class DiffRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    user: str = Field(min_length=1, max_length=256)
+    from_: datetime = Field(alias="from")
+    to: datetime
+
+
+class ReplacedPair(BaseModel):
+    old: FactOut
+    new: FactOut
+
+
+class DiffResponse(BaseModel):
+    added: list[FactOut]
+    replaced: list[ReplacedPair]
+    invalidated: list[FactOut]
 
 
 class ForgetRequest(BaseModel):

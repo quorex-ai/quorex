@@ -1,3 +1,4 @@
+"""Modèle de fait bitemporel (ADR-002). Aucune dépendance à SQL ici."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -21,7 +22,12 @@ class EndReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class NewFact:
-    """Ce que le moteur veut écrire. Les identifiants et recorded_at sont posés par le store."""
+    """Ce que le moteur veut écrire.
+
+    valid_from et recorded_at à None signifient « maintenant, horloge de la base » :
+    le store les pose dans la même instruction SQL, donc identiques (jalon 3).
+    recorded_at n'est jamais exposé par l'API ; il sert aux tests et aux imports.
+    """
 
     tenant_id: UUID
     user_id: UUID
@@ -30,8 +36,9 @@ class NewFact:
     value: str
     confidence: float
     durability: Durability
-    valid_from: datetime
     subject: str = "user"
+    valid_from: datetime | None = None
+    recorded_at: datetime | None = None
     expires_at: datetime | None = None
     source_message_id: UUID | None = None
     attribute_embedding: list[float] | None = None

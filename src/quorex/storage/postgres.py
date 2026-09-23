@@ -1,3 +1,10 @@
+"""PostgresFactStore : la seule implémentation de FactStore en v1 (ADR-001).
+
+Jalon 1 : create, get_active, get_by_id, list_active, close.
+Jalon 2 : replace (atomique).
+Jalon 3 : list_as_of, diff, horloge unique (recorded_at et valid_from posés par la base).
+Jalon 5 : find_similar_active, search.
+"""
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -12,18 +19,30 @@ from quorex.ids import new_id
 from quorex.storage.db import Database
 from quorex.storage.rows import FACT_COLUMNS, to_fact, vector_literal
 
+# COALESCE(:x, now()) : quand l'appelant ne fixe pas la date, la base la pose,
+# et recorded_at / valid_from sortent de la même horloge, dans la même instruction.
 _INSERT = text(f"""
     INSERT INTO facts (
         id, tenant_id, user_id, subject, attribute, attribute_raw, value, confidence,
-        durability, expires_at, source_message_id, valid_from,
+        durability, expires_at, source_message_id, valid_from, recorded_at,
         attribute_embedding, value_embedding
     ) VALUES (
         :id, :tenant_id, :user_id, :subject, :attribute, :attribute_raw, :value, :confidence,
-        :durability, :expires_at, :source_message_id, :valid_from,
+        :durability, :expires_at, :source_message_id,
+        COALESCE(:valid_from, now()), COALESCE(:recorded_at, now()),
         CAST(:attribute_embedding AS vector), CAST(:value_embedding AS vector)
     )
     RETURNING {FACT_COLUMNS}
 """)
+
+# Condition bitemporelle (architecture.md 5.1) : ce que le système savait à as_of,
+# et qui était vrai à as_of.
+_AS_OF = """
+    recorded_at <= :as_of
+    AND valid_from <= :as_of
+    AND (valid_to IS NULL OR valid_to > :as_of)
+    AND (expires_at IS NULL OR expires_at > :as_of)
+"""
 
 
 def _insert_params(fact: NewFact, fact_id: UUID) -> dict:
@@ -40,6 +59,7 @@ def _insert_params(fact: NewFact, fact_id: UUID) -> dict:
         "expires_at": fact.expires_at,
         "source_message_id": fact.source_message_id,
         "valid_from": fact.valid_from,
+        "recorded_at": fact.recorded_at,
         "attribute_embedding": vector_literal(fact.attribute_embedding),
         "value_embedding": vector_literal(fact.value_embedding),
     }
@@ -84,17 +104,59 @@ class PostgresFactStore:
             rows = conn.execute(sql, params).all()
         return [to_fact(r) for r in rows]
 
-    def list_as_of(self, tenant_id: UUID, user_id: UUID, as_of: datetime, attributes: list[str] | None = None) -> list[Fact]:
-        raise NotImplementedError("jalon 3")
+    def list_as_of(
+        self, tenant_id: UUID, user_id: UUID, as_of: datetime, attributes: list[str] | None = None
+    ) -> list[Fact]:
+        clauses = ["tenant_id = :tenant_id", "user_id = :user_id", _AS_OF]
+        params: dict = {"tenant_id": tenant_id, "user_id": user_id, "as_of": as_of}
+        if attributes:
+            clauses.append("attribute = ANY(:attributes)")
+            params["attributes"] = attributes
+        sql = text(f"SELECT {FACT_COLUMNS} FROM facts WHERE {' AND '.join(clauses)} ORDER BY recorded_at DESC")
+        with self._db.transaction() as conn:
+            rows = conn.execute(sql, params).all()
+        return [to_fact(r) for r in rows]
+
+    def diff(self, tenant_id: UUID, user_id: UUID, from_: datetime, to: datetime) -> Diff:
+        """Ce qui a changé dans (from_, to] (architecture.md 5.2)."""
+        base = "tenant_id = :tenant_id AND user_id = :user_id"
+        params = {"tenant_id": tenant_id, "user_id": user_id, "from_": from_, "to": to}
+        with self._db.transaction() as conn:
+            added = conn.execute(text(f"""
+                SELECT {FACT_COLUMNS} FROM facts
+                WHERE {base} AND recorded_at > :from_ AND recorded_at <= :to
+                  AND (valid_to IS NULL OR valid_to > :to)
+                ORDER BY recorded_at
+            """), params).all()
+            replaced = conn.execute(text(f"""
+                SELECT {FACT_COLUMNS} FROM facts
+                WHERE {base} AND valid_to > :from_ AND valid_to <= :to AND end_reason = 'replaced'
+                ORDER BY valid_to
+            """), params).all()
+            invalidated = conn.execute(text(f"""
+                SELECT {FACT_COLUMNS} FROM facts
+                WHERE {base} AND valid_to > :from_ AND valid_to <= :to
+                  AND end_reason IN ('invalidated', 'expired', 'forgotten')
+                ORDER BY valid_to
+            """), params).all()
+            pairs: list[tuple[Fact, Fact]] = []
+            for r in replaced:
+                old = to_fact(r)
+                new_row = conn.execute(
+                    text(f"SELECT {FACT_COLUMNS} FROM facts WHERE id = :id"), {"id": old.replaced_by}
+                ).one()
+                pairs.append((old, to_fact(new_row)))
+        return Diff(
+            added=[to_fact(r) for r in added],
+            replaced=pairs,
+            invalidated=[to_fact(r) for r in invalidated],
+        )
 
     def find_similar_active(self, tenant_id: UUID, user_id: UUID, attribute_embedding: list[float], limit: int = 5) -> list[tuple[Fact, float]]:
         raise NotImplementedError("jalon 5")
 
     def search(self, tenant_id: UUID, user_id: UUID, query_embedding: list[float], as_of: datetime | None = None, limit: int = 20) -> list[tuple[Fact, float]]:
         raise NotImplementedError("jalon 5")
-
-    def diff(self, tenant_id: UUID, user_id: UUID, from_: datetime, to: datetime) -> Diff:
-        raise NotImplementedError("jalon 3")
 
     # ---------- écriture ----------
 
@@ -110,11 +172,9 @@ class PostgresFactStore:
     def replace(self, old_id: UUID, new: NewFact) -> tuple[Fact, Fact]:
         """Une transaction : clore l'ancien, insérer le nouveau, lier replaced_by.
 
-        L'UPDATE de clôture porte 'AND valid_to IS NULL' : si une autre écriture a déjà
-        clos l'ancien, zéro ligne -> StaleFact, et rien n'est écrit (rollback).
-        L'INSERT peut violer facts_active_unique si un autre fait actif est apparu
-        entre-temps -> ActiveFactExists, rollback aussi. L'appelant (contradiction/)
-        relit et rejoue une fois.
+        L'ancien est clos à valid_from du nouveau (ou now() si non fourni), jamais avant
+        son propre valid_from. Si l'ancien n'est plus actif -> StaleFact, rollback.
+        Si un autre fait actif occupe déjà l'attribut -> ActiveFactExists, rollback.
         """
         new_id_ = new_id()
         try:
@@ -151,11 +211,11 @@ class PostgresFactStore:
         row = conn.execute(
             text(f"""
                 UPDATE facts
-                   SET valid_to = GREATEST(:at, valid_from), end_reason = :reason
+                   SET valid_to = GREATEST(COALESCE(:at, now()), valid_from), end_reason = :reason
                  WHERE tenant_id = :tenant_id AND id = :id AND valid_to IS NULL
                 RETURNING {FACT_COLUMNS}
             """),
-            {"at": at or datetime.now(UTC), "reason": reason.value, "tenant_id": tenant_id, "id": fact_id},
+            {"at": at, "reason": reason.value, "tenant_id": tenant_id, "id": fact_id},
         ).first()
         return to_fact(row) if row else None
 

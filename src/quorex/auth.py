@@ -26,7 +26,7 @@ def generate_api_key() -> GeneratedKey:
     plain = f"{_HEADER}{prefix}{secret}"
     return GeneratedKey(plain=plain, prefix=prefix, hash=_hasher.hash(plain))
 
-def extract_prefix(plain: str) -> str:
+def extract_prefix(plain: str) -> str | None:
     """Retourne le préfixe d'une clé bien formée, None sinon."""
     if not plain.startswith(_HEADER):
         return None

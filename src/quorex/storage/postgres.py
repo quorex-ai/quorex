@@ -139,13 +139,15 @@ class PostgresFactStore:
                   AND end_reason IN ('invalidated', 'expired', 'forgotten')
                 ORDER BY valid_to
             """), params).all()
-            pairs: list[tuple[Fact, Fact]] = []
-            for r in replaced:
-                old = to_fact(r)
-                new_row = conn.execute(
-                    text(f"SELECT {FACT_COLUMNS} FROM facts WHERE id = :id"), {"id": old.replaced_by}
-                ).one()
-                pairs.append((old, to_fact(new_row)))
+            olds = [to_fact(r) for r in replaced]
+            successors: dict[UUID, Fact] = {}
+            if olds:
+                rows = conn.execute(
+                    text(f"SELECT {FACT_COLUMNS} FROM facts WHERE id = ANY(:ids)"),
+                    {"ids": [old.replaced_by for old in olds]},
+                ).all()
+                successors = {f.id: f for f in map(to_fact, rows)}
+            pairs: list[tuple[Fact, Fact]] = [(old, successors[old.replaced_by]) for old in olds]
         return Diff(
             added=[to_fact(r) for r in added],
             replaced=pairs,

@@ -63,7 +63,7 @@ class RememberResult(BaseModel):
 
 class RememberResponse(BaseModel):
     facts: list[RememberResult]
-    warnings: list[str] = []
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RecallRequest(BaseModel):

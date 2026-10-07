@@ -61,4 +61,4 @@ class Resolver:
                 last_error = e
                 log.info("contradiction.retry", reason=type(e).__name__, attempt=attempt)
                 continue
-            raise ConcurrentWrite(str(last_error))
+        raise ConcurrentWrite(str(last_error))

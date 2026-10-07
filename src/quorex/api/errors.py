@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+log = structlog.get_logger()
 
 class ApiError(Exception):
     status: int = 500
@@ -58,5 +61,6 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
-        # Jamais str(e) ni de stack dans le corps (audi legacy, 04-qualite.
+        # Jamais str(e) ni de stack dans le corps (audi legacy, 04-qualite. La stack va dans les logs.
+        log.exception("unhandled_error", request_id=getattr(request.state, "request_id", None))
         return JSONResponse(status_code=500, content=_payload(request, "internal_error", "erreur interne", None))
